@@ -736,6 +736,13 @@ with st.sidebar:
     st.info(f"👤 **{auth['Nombre']}**\n\n🪪 {auth['Documento']} · 🎭 {auth['Rol']}")
     if st.button("🚪 Cerrar Sesión", use_container_width=True):
         cerrar_sesion()
+    if st.button("🔄 Sincronizar con Drive", use_container_width=True,
+                 help="Fuerza descarga y subida inmediata de todos los datos con Google Drive"):
+        with st.spinner("Sincronizando con Drive..."):
+            ok_sync, det_sync = drive_sync.sincronizacion_manual()
+        st.session_state["_sync_msg"] = (ok_sync, det_sync)
+        st.cache_data.clear()
+        st.rerun()
     st.divider()
     st.session_state.pagina = st.radio("Menú", MENU, index=MENU.index(st.session_state.pagina))
     st.divider()
@@ -745,6 +752,14 @@ with st.sidebar:
         st.warning("Aún no hay base local. Ejecuta `python init_db.py` o carga productos en Inventario.")
 
 pg = st.session_state.pagina
+
+_sync_msg = st.session_state.pop("_sync_msg", None)
+if _sync_msg:
+    _ok_m, _det_m = _sync_msg
+    if _ok_m:
+        st.success(f"✅ {_det_m}")
+    else:
+        st.error(f"❌ {_det_m}")
 
 # --------------------------------------------------------------- PANEL PRINCIPAL
 if pg == "📊 Panel Principal":
@@ -1041,7 +1056,13 @@ elif pg == "🧾 Ventas y Caja":
     if not len(inv):
         st.warning("Primero carga productos en 📦 Inventario.")
         st.stop()
-    t1, t2 = st.tabs(["🛒 Nueva venta", "📜 Historial y totales"])
+    _tabs_ventas = (["🛒 Nueva venta", "📜 Historial y totales", "🗑️ Historial y Borrado"]
+                    if puede_editar_inventario() else ["🛒 Nueva venta", "📜 Historial y totales"])
+    if len(_tabs_ventas) == 3:
+        t1, t2, t3v = st.tabs(_tabs_ventas)
+    else:
+        t1, t2 = st.tabs(_tabs_ventas)
+        t3v = None
 
     with t1:
         # --- Ticket recién cobrado: vista de impresión + disparo automático ---
@@ -1165,6 +1186,67 @@ elif pg == "🧾 Ventas y Caja":
             st.download_button("⬇️ Descargar reporte de ventas (.xlsx)",
                                df_a_excel_bytes({"Ventas": f[COL_VENTAS]}),
                                file_name=f"ventas-MM-{d1}_{d2}.xlsx")
+
+    if t3v is not None:
+        with t3v:
+            # Sub-pestaña restringida: solo Admin / SuperUsuario (Cajero ni la ve)
+            if not puede_editar_inventario():
+                st.error("🔒 Acceso restringido: solo Admin o SuperUsuario pueden borrar ventas.")
+                st.stop()
+            st.subheader("🗑️ Historial y Borrado de Ventas")
+            st.caption("Cada ticket eliminado descuenta sus líneas de `ventas.xlsx`, "
+                       "devuelve las cantidades al stock y sincroniza con Drive de inmediato.")
+            vb = ventas.copy()
+            if not len(vb):
+                st.info("Sin ventas registradas.")
+            else:
+                vb["Fecha"] = pd.to_datetime(vb["Fecha"], errors="coerce")
+                resumen = vb.groupby("ID_Venta").agg(
+                    Fecha=("Fecha", "min"), Items=("SKU", "count"), Total=("Total", "sum"),
+                    Metodo=("Metodo_Pago", "first"),
+                    Vendedor=("Vendedor_Nombre", lambda s: s.fillna("").iloc[0] if len(s) else "")).reset_index()
+                resumen = resumen.sort_values("Fecha", ascending=False)
+                ver_r = resumen.copy()
+                ver_r["Total"] = ver_r["Total"].map(fmt_gs)
+                st.dataframe(ver_r, use_container_width=True)
+                sel_t = st.selectbox(
+                    "Ticket a revisar / borrar",
+                    resumen.apply(lambda r: f"{r['ID_Venta']} — {fmt_gs(r['Total'])} ({int(r['Items'])} ítems)",
+                                  axis=1).tolist(),
+                    key="venta_del_sel")
+                id_t = sel_t.split(" — ")[0]
+                lineas = vb[vb["ID_Venta"] == id_t].copy()
+                det = lineas[["SKU", "Producto", "Cantidad", "Precio_Unitario", "Total"]].copy()
+                det["Precio_Unitario"] = det["Precio_Unitario"].map(fmt_gs)
+                det["Total"] = det["Total"].map(fmt_gs)
+                st.dataframe(det, use_container_width=True)
+                f0 = lineas.iloc[0]
+                _vn, _vd = f0.get("Vendedor_Nombre"), f0.get("Vendedor_Doc")
+                _vend_txt = ("—" if pd.isna(_vn) or str(_vn).strip() == ""
+                             else f"{_vn} ({'—' if pd.isna(_vd) else _vd})")
+                st.caption(f"Fecha: {f0['Fecha']} · Método: {f0['Metodo_Pago']} · Caja: {f0['Caja']} · "
+                           f"Vendedor: {_vend_txt} · Total: {fmt_gs(lineas['Total'].sum())}")
+                conf_b = st.checkbox(f"Confirmo eliminar el ticket {id_t} y devolver su stock",
+                                     key="venta_del_conf")
+                if st.button("🗑️ Eliminar venta definitivamente", type="primary", key="venta_del_go"):
+                    if not conf_b:
+                        st.warning("Marca la confirmación primero.")
+                    else:
+                        # 1. Devolver cantidades al stock (misma regla que la venta: servicios no se tocan)
+                        base = inv.set_index("SKU")
+                        devueltos = 0
+                        for _, r in lineas.iterrows():
+                            sku = str(r["SKU"])
+                            if sku in base.index and int(base.loc[sku, "Stock_Actual"]) < 9000:
+                                base.loc[sku, "Stock_Actual"] = (
+                                    int(base.loc[sku, "Stock_Actual"]) + int(r["Cantidad"]))
+                                devueltos += int(r["Cantidad"])
+                        guardar_inventario(base.reset_index())
+                        # 2. Borrar las líneas (sincroniza ventas.xlsx + Drive vía hook)
+                        guardar_ventas(ventas[ventas["ID_Venta"] != id_t].reset_index(drop=True))
+                        st.success(f"✅ Ticket {id_t} eliminado ({fmt_gs(lineas['Total'].sum())}). "
+                                   f"Stock devuelto: {devueltos} unidad(es). Drive sincronizado.")
+                        st.rerun()
 
 # ---------------------------------------------------------------- DEUDORES
 elif pg == "🤝 Deudores":

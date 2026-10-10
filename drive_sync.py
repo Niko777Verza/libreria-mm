@@ -180,3 +180,35 @@ def subir_si_nube(nombre: str) -> bool:
                         f"manualmente a la carpeta de Drive una vez; luego la app lo actualizará sola.")
         st.warning(f"⚠️ Guardado local OK, pero falló la subida a Drive ({nombre}): {detalle}")
         return False
+
+
+def sincronizacion_manual() -> tuple[bool, str]:
+    """Fuerza sincronización inmediata en ambos sentidos. Nunca lanza.
+
+    1) Descarga todo desde Drive (la nube manda: trae cambios de otros equipos).
+    2) Sube el espejo local (deja la nube igualada + siembra faltantes).
+    Devuelve (ok, mensaje_para_mostrar).
+    """
+    if not modo_nube():
+        return False, "Sin conexión a Drive (modo local). Configura los secrets para sincronizar."
+    try:
+        bajados, subidos = [], []
+        for nombre in ARCHIVOS_SYNC:
+            try:
+                if descargar(nombre):
+                    bajados.append(nombre)
+            except Exception:
+                continue
+        for nombre in ARCHIVOS_SYNC:
+            try:
+                if (DATA_DIR / nombre).exists() and subir(nombre):
+                    subidos.append(nombre)
+            except Exception:
+                continue
+        if not bajados and not subidos:
+            return True, "Conectado a Drive: no había cambios pendientes."
+        return True, (f"Datos actualizados con la nube. "
+                      f"Descargados ({len(bajados)}): {', '.join(bajados) or '—'}. "
+                      f"Subidos ({len(subidos)}): {', '.join(subidos) or '—'}.")
+    except Exception as e:  # noqa: BLE001
+        return False, f"No se pudo sincronizar con Drive: {e}"
