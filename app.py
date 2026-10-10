@@ -133,8 +133,6 @@ def guardar_nueva_categoria(nombre: str) -> bool:
     extras = _categorias_guardadas()
     extras.append(nombre)
     CAT_PATH.write_text("\n".join(sorted(set(extras))), encoding="utf-8")
-    drive_sync.subir_si_nube("categorias.txt")
-    drive_sync.subir_si_nube("categorias_ocultas.txt")
     return True
 
 
@@ -163,8 +161,6 @@ def eliminar_categoria(nombre: str) -> tuple[bool, int]:
     if nombre.lower() in {c.lower() for c in CATEGORIAS_DEFAULT}:
         ocultas = _categorias_ocultas() + [nombre]
         CAT_HIDE_PATH.write_text("\n".join(sorted(set(ocultas))), encoding="utf-8")
-    drive_sync.subir_si_nube("categorias.txt")
-    drive_sync.subir_si_nube("categorias_ocultas.txt")
     st.cache_data.clear()
     return True, n
 
@@ -278,7 +274,6 @@ def guardar_inventario(df: pd.DataFrame) -> None:
     for c in df["Categoria"].dropna().unique().tolist():
         guardar_nueva_categoria(str(c))
     _guardar_excel(df[COL_INV], INV_PATH, "Inventario")
-    drive_sync.subir_si_nube("inventario.xlsx")
     st.cache_data.clear()
 
 
@@ -288,7 +283,6 @@ def guardar_ventas(df: pd.DataFrame) -> None:
     for c in ("Precio_Unitario", "Total"):
         df[c] = pd.to_numeric(df[c], errors="coerce").fillna(0).round(0).astype(int)
     _guardar_excel(df[COL_VENTAS], VENTAS_PATH, "Ventas")
-    drive_sync.subir_si_nube("ventas.xlsx")
     st.cache_data.clear()
 
 
@@ -297,7 +291,6 @@ def guardar_deudores(df: pd.DataFrame) -> None:
     for c in ("Monto_Total", "Monto_Pagado", "Saldo"):
         df[c] = pd.to_numeric(df[c], errors="coerce").fillna(0).round(0).astype(int)
     _guardar_excel(df[COL_DEUD], DEUD_PATH, "Deudores")
-    drive_sync.subir_si_nube("deudores.xlsx")
     st.cache_data.clear()
 
 
@@ -322,7 +315,6 @@ def cargar_usuarios() -> pd.DataFrame:
 
 def guardar_usuarios(df: pd.DataFrame) -> None:
     _guardar_excel(df[COL_USU], USU_PATH, "Usuarios")
-    drive_sync.subir_si_nube("usuarios.xlsx")
     st.cache_data.clear()
 
 
@@ -684,7 +676,8 @@ if "pagina" not in st.session_state:
 if st.session_state.pagina == "📊 Dashboard":  # migración desde el nombre anterior
     st.session_state.pagina = "📊 Panel Principal"
 
-MODO_ALMACEN = drive_sync.sincronizar_inicio()  # "nube" o "local" (descarga de Drive si hay)
+# Los datos se leen/escriben solo en local (data/). La nube se sincroniza
+# exclusivamente con el botón manual "🔄 Sincronizar con Drive" del sidebar.
 inv = cargar_inventario()
 ventas = cargar_ventas()
 deud = cargar_deudores()

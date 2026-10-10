@@ -167,21 +167,6 @@ def sincronizar_inicio() -> str:
         return "local"
 
 
-def subir_si_nube(nombre: str) -> bool:
-    """Wrapper seguro para llamar tras cada guardado crítico. Nunca lanza."""
-    if not modo_nube():
-        return False
-    try:
-        return subir(nombre)
-    except Exception as e:  # noqa: BLE001
-        detalle = str(e)
-        if "storageQuotaExceeded" in detalle or "403" in detalle:
-            detalle += (f" — Las cuentas de servicio no pueden CREAR archivos: sube '{nombre}' "
-                        f"manualmente a la carpeta de Drive una vez; luego la app lo actualizará sola.")
-        st.warning(f"⚠️ Guardado local OK, pero falló la subida a Drive ({nombre}): {detalle}")
-        return False
-
-
 def sincronizacion_manual() -> tuple[bool, str]:
     """Fuerza sincronización inmediata en ambos sentidos. Nunca lanza.
 
