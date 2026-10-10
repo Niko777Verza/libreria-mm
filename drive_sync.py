@@ -174,5 +174,9 @@ def subir_si_nube(nombre: str) -> bool:
     try:
         return subir(nombre)
     except Exception as e:  # noqa: BLE001
-        st.warning(f"⚠️ Guardado local OK, pero falló la subida a Drive ({nombre}): {e}")
+        detalle = str(e)
+        if "storageQuotaExceeded" in detalle or "403" in detalle:
+            detalle += (f" — Las cuentas de servicio no pueden CREAR archivos: sube '{nombre}' "
+                        f"manualmente a la carpeta de Drive una vez; luego la app lo actualizará sola.")
+        st.warning(f"⚠️ Guardado local OK, pero falló la subida a Drive ({nombre}): {detalle}")
         return False
