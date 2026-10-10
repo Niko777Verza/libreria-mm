@@ -18,6 +18,8 @@ import streamlit.components.v1 as components
 from openpyxl.styles import Alignment, Border, Font, PatternFill, Side
 from openpyxl.utils import get_column_letter
 
+import drive_sync  # almacenamiento persistente (Drive en nube, local en PC)
+
 # ---------------------------------------------------------------- Config
 APP_TITULO = "📚 Librería MM — Gestión"
 BASE = Path(__file__).resolve().parent
@@ -131,6 +133,8 @@ def guardar_nueva_categoria(nombre: str) -> bool:
     extras = _categorias_guardadas()
     extras.append(nombre)
     CAT_PATH.write_text("\n".join(sorted(set(extras))), encoding="utf-8")
+    drive_sync.subir_si_nube("categorias.txt")
+    drive_sync.subir_si_nube("categorias_ocultas.txt")
     return True
 
 
@@ -159,6 +163,8 @@ def eliminar_categoria(nombre: str) -> tuple[bool, int]:
     if nombre.lower() in {c.lower() for c in CATEGORIAS_DEFAULT}:
         ocultas = _categorias_ocultas() + [nombre]
         CAT_HIDE_PATH.write_text("\n".join(sorted(set(ocultas))), encoding="utf-8")
+    drive_sync.subir_si_nube("categorias.txt")
+    drive_sync.subir_si_nube("categorias_ocultas.txt")
     st.cache_data.clear()
     return True, n
 
@@ -272,6 +278,7 @@ def guardar_inventario(df: pd.DataFrame) -> None:
     for c in df["Categoria"].dropna().unique().tolist():
         guardar_nueva_categoria(str(c))
     _guardar_excel(df[COL_INV], INV_PATH, "Inventario")
+    drive_sync.subir_si_nube("inventario.xlsx")
     st.cache_data.clear()
 
 
@@ -281,6 +288,7 @@ def guardar_ventas(df: pd.DataFrame) -> None:
     for c in ("Precio_Unitario", "Total"):
         df[c] = pd.to_numeric(df[c], errors="coerce").fillna(0).round(0).astype(int)
     _guardar_excel(df[COL_VENTAS], VENTAS_PATH, "Ventas")
+    drive_sync.subir_si_nube("ventas.xlsx")
     st.cache_data.clear()
 
 
@@ -289,6 +297,7 @@ def guardar_deudores(df: pd.DataFrame) -> None:
     for c in ("Monto_Total", "Monto_Pagado", "Saldo"):
         df[c] = pd.to_numeric(df[c], errors="coerce").fillna(0).round(0).astype(int)
     _guardar_excel(df[COL_DEUD], DEUD_PATH, "Deudores")
+    drive_sync.subir_si_nube("deudores.xlsx")
     st.cache_data.clear()
 
 
@@ -313,6 +322,7 @@ def cargar_usuarios() -> pd.DataFrame:
 
 def guardar_usuarios(df: pd.DataFrame) -> None:
     _guardar_excel(df[COL_USU], USU_PATH, "Usuarios")
+    drive_sync.subir_si_nube("usuarios.xlsx")
     st.cache_data.clear()
 
 
@@ -674,6 +684,7 @@ if "pagina" not in st.session_state:
 if st.session_state.pagina == "📊 Dashboard":  # migración desde el nombre anterior
     st.session_state.pagina = "📊 Panel Principal"
 
+MODO_ALMACEN = drive_sync.sincronizar_inicio()  # "nube" o "local" (descarga de Drive si hay)
 inv = cargar_inventario()
 ventas = cargar_ventas()
 deud = cargar_deudores()
@@ -720,6 +731,7 @@ if st.session_state.pagina not in MENU:
 with st.sidebar:
     st.title("📚 Librería MM")
     st.caption("Inventario · Caja · Deudores · Gs.")
+    st.caption(f"Almacenamiento: **{drive_sync.estado_almacenamiento()}**")
     auth = st.session_state.auth
     st.info(f"👤 **{auth['Nombre']}**\n\n🪪 {auth['Documento']} · 🎭 {auth['Rol']}")
     if st.button("🚪 Cerrar Sesión", use_container_width=True):
