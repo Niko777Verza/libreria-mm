@@ -10,9 +10,7 @@ Estrategia con PRIORIDAD ABSOLUTA A LA NUBE (cloud-wins):
     siempre tras respaldar lo local en `data/_backup_sync/`.
   - Solo se SUBE cuando lo local es claramente más reciente (venta o edición
     posterior a la última sincronización) o cuando el archivo no existe en
-    Drive (siembra). Las tablas de movimientos (ventas, deudores) no se
-    reemplazan jamás: se FUSIONAN (unión sin duplicados por ID) y el resultado
-    queda en ambos lados, así ningún dispositivo pisa al otro.
+    Drive (siembra inicial).
   - Tras cada operación se registra el estado (mtimes de ambos lados) para
     no re-transferir lo ya igualado y resistir desfases de reloj.
 
@@ -30,7 +28,6 @@ import shutil
 from datetime import datetime, timezone
 from pathlib import Path
 
-import pandas as pd
 import streamlit as st
 
 BASE = Path(__file__).resolve().parent
@@ -39,10 +36,6 @@ IDS_PATH = DATA_DIR / ".drive_ids.json"  # caché fileId + estado de sync (ignor
 
 ARCHIVOS_SYNC = ["inventario.xlsx", "ventas.xlsx", "deudores.xlsx",
                  "usuarios.xlsx", "categorias.txt", "categorias_ocultas.txt"]
-# Tablas de movimientos con fusión (unión sin duplicados) en vez de reemplazo.
-# El resto (inventario, usuarios, categorías) mantiene reemplazo con prioridad-nube.
-MERGEABLE = {"ventas.xlsx", "deudores.xlsx"}
-HOJA_POR_ARCHIVO = {"ventas.xlsx": "Ventas", "deudores.xlsx": "Deudores"}
 MIMETYPES = {".xlsx": "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
              ".txt": "text/plain"}
 SCOPES = ["https://www.googleapis.com/auth/drive"]
@@ -295,145 +288,6 @@ def _marcar(service, folder: str, nombre: str) -> None:
         pass
 
 
-def _norm_val(v) -> str:
-    """Normaliza un valor de celda para comparar filas (63000 == 63000.0 == '63000')."""
-    try:
-        if pd.isna(v):
-            return ""
-    except (TypeError, ValueError):
-        pass
-    if isinstance(v, float) and v.is_integer():
-        return str(int(v))
-    if hasattr(v, "isoformat") and not isinstance(v, str):
-        try:
-            return str(v.isoformat(sep=" "))  # type: ignore[union-attr]
-        except Exception:
-            pass
-    return str(v).strip()
-
-
-def _leer_tabla(path: Path) -> pd.DataFrame:
-    try:
-        return pd.read_excel(path, sheet_name=0)
-    except Exception:
-        return pd.DataFrame()
-
-
-def _leer_tabla_bytes(raw: bytes) -> pd.DataFrame:
-    try:
-        return pd.read_excel(io.BytesIO(raw), sheet_name=0)
-    except Exception:
-        return pd.DataFrame()
-
-
-def _claves_filas(df: pd.DataFrame, cols: list) -> pd.Series:
-    return pd.Series([tuple(_norm_val(v) for v in fila)
-                      for fila in df.reindex(columns=cols).itertuples(index=False)],
-                     index=df.index)
-
-
-def _mismo_contenido(a: pd.DataFrame, b: pd.DataFrame) -> bool:
-    cols = list(a.columns) + [c for c in b.columns if c not in a.columns]
-    try:
-        return _claves_filas(a, cols).sort_values().tolist() == \
-               _claves_filas(b, cols).sort_values().tolist()
-    except Exception:
-        return False
-
-
-def _fusionar_deudores(todo: pd.DataFrame) -> pd.DataFrame:
-    """Resuelve filas con el mismo ID: gana la de mayor Monto_Pagado (abono más
-    nuevo); en empate, la de Concepto más largo (más productos agregados);
-    en empate, la remota (prioridad-nube). Se elige la fila completa para no
-    romper la invariante Total - Pagado = Saldo."""
-    def _elige(grupo: pd.DataFrame) -> pd.DataFrame:
-        if len(grupo) == 1:
-            return grupo.iloc[[0]]
-        g = grupo.copy()
-        g["_pag"] = pd.to_numeric(g.get("Monto_Pagado"), errors="coerce").fillna(0)
-        g["_len"] = g.get("Concepto").fillna("").astype(str).str.len() \
-            if "Concepto" in g.columns else 0
-        g["_rem"] = (g.get("_origen") == "remoto").astype(int) \
-            if "_origen" in g.columns else 0
-        idx = g.sort_values(["_pag", "_len", "_rem"],
-                            ascending=[False, False, False]).index[0]
-        return grupo.loc[[idx]]
-
-    id_col = "ID" if "ID" in todo.columns else todo.columns[0]
-    try:
-        out = pd.concat([_elige(g) for _, g in todo.groupby(id_col, dropna=False)],
-                        ignore_index=True)
-    except Exception:
-        out = todo
-    try:
-        out = out.sort_values(id_col).reset_index(drop=True)
-    except Exception:
-        pass
-    return out
-
-
-def fusionar_tablas(local_df: pd.DataFrame, remoto_df: pd.DataFrame, nombre: str) -> pd.DataFrame:
-    """Une dos versiones de una tabla sin perder ni duplicar registros."""
-    cols = list(local_df.columns) + [c for c in remoto_df.columns if c not in local_df.columns]
-    if not cols:
-        return local_df.copy()
-    loc = local_df.reindex(columns=cols).copy()
-    rem = remoto_df.reindex(columns=cols).copy()
-    loc["_origen"] = "local"
-    rem["_origen"] = "remoto"
-    todo = pd.concat([loc, rem], ignore_index=True)
-    todo["_clave"] = _claves_filas(todo, cols)
-    todo = todo.drop_duplicates(subset=["_clave"], keep="first")
-    if nombre == "deudores.xlsx":
-        todo = _fusionar_deudores(todo)
-    elif nombre == "ventas.xlsx":
-        try:
-            todo["_f"] = pd.to_datetime(todo["Fecha"], errors="coerce")
-            todo = todo.sort_values(["_f", "ID_Venta"]).reset_index(drop=True)
-        except Exception:
-            pass
-    return todo.drop(columns=[c for c in ("_clave", "_origen", "_f") if c in todo.columns])
-
-
-def _descargar_bytes(service, fid: str) -> bytes:
-    from googleapiclient.http import MediaIoBaseDownload
-
-    req = service.files().get_media(fileId=fid, supportsAllDrives=True)
-    buf = io.BytesIO()
-    downloader = MediaIoBaseDownload(buf, req)
-    done = False
-    while not done:
-        _, done = downloader.next_chunk()
-    return buf.getvalue()
-
-
-def _escribir_tabla(df: pd.DataFrame, path: Path, hoja: str) -> None:
-    DATA_DIR.mkdir(exist_ok=True)
-    with pd.ExcelWriter(path, engine="openpyxl") as w:
-        df.to_excel(w, sheet_name=hoja, index=False)
-
-
-def fusionar_archivo(service, folder: str, nombre: str) -> str:
-    """Fusiona la versión local con la de Drive (unión sin duplicados) y deja
-    el resultado en AMBOS lados. Devuelve "fusionado" o "igual"."""
-    ids = _ids()
-    fid = ids.get(nombre) or _id_en_drive(service, folder, nombre)
-    if not fid:
-        raise RuntimeError(f"{nombre} no existe en Drive")
-    remoto_bytes = _descargar_bytes(service, fid)
-    local_df = _leer_tabla(DATA_DIR / nombre)
-    remoto_df = _leer_tabla_bytes(remoto_bytes)
-    fusionado = fusionar_tablas(local_df, remoto_df, nombre)
-    if _mismo_contenido(fusionado, local_df) and _mismo_contenido(fusionado, remoto_df):
-        _marcar(service, folder, nombre)
-        return "igual"
-    _respaldar_local(nombre)
-    _escribir_tabla(fusionado, DATA_DIR / nombre, HOJA_POR_ARCHIVO[nombre])
-    subir(nombre)
-    _marcar(service, folder, nombre)
-    return "fusionado"
-
-
 def _sincronizar_uno(service, folder: str, nombre: str) -> str:
     """Sincroniza un archivo con PRIORIDAD A LA NUBE.
 
@@ -462,20 +316,6 @@ def _sincronizar_uno(service, folder: str, nombre: str) -> str:
         return "subido"
 
     rec = _estado().get(nombre)
-    if nombre in MERGEABLE:
-        # Tablas de movimientos: jamás se reemplazan; se fusionan (unión sin
-        # duplicados) para que ningún dispositivo pise al otro.
-        if rec is not None:
-            try:
-                cambio_local = abs(lts - float(rec.get("l", lts))) > TOLERANCIA_SEG
-                if not cambio_local and rec.get("h"):
-                    cambio_local = _hash_local(nombre) != rec.get("h")
-                cambio_remoto = abs(rts - float(rec.get("r", rts))) > TOLERANCIA_SEG
-            except (TypeError, ValueError):
-                cambio_local = cambio_remoto = True
-            if not cambio_local and not cambio_remoto:
-                return "igual"
-        return fusionar_archivo(service, folder, nombre)
     if rec is None:
         # Bootstrap: comparación absoluta; empate -> nube.
         assert lts is not None
@@ -542,9 +382,7 @@ def sincronizar_inicio() -> str:
 def sincronizacion_manual() -> tuple[bool, str]:
     """Sincronización manual del botón "🔄 Sincronizar con Drive". Nunca lanza.
 
-    Dirección prioritaria: DESCARGA (la nube es la versión oficial), con FUSIÓN
-    en tablas de movimientos (ventas, deudores): en vez de reemplazar, se
-    concatenan ambas versiones por ID/fila para no duplicar ni perder registros.
+    Dirección prioritaria: DESCARGA (la nube es la versión oficial).
     1) Por cada archivo compara estado local vs. Drive (timestamps + registro).
     2) Drive más reciente, empate o conflicto -> se DESCARGA tras respaldar
        lo local en data/_backup_sync/. Lo local obsoleto jamás sobrescribe.
@@ -560,7 +398,7 @@ def sincronizacion_manual() -> tuple[bool, str]:
         cfg = _leer_secrets()
         assert cfg is not None
         service = _servicio()
-        subidos, bajados, iguales, conflictos, fusionados, errores = [], [], [], [], [], []
+        subidos, bajados, iguales, conflictos, errores = [], [], [], [], []
         for nombre in ARCHIVOS_SYNC:
             try:
                 r = _sincronizar_uno(service, cfg["folder"], nombre)
@@ -568,16 +406,14 @@ def sincronizacion_manual() -> tuple[bool, str]:
                 errores.append(f"{nombre} ({e})")
                 continue
             {"subido": subidos, "descargado": bajados, "igual": iguales,
-             "conflicto": conflictos, "fusionado": fusionados, "omitido": []}[r].append(nombre)
-        if not subidos and not bajados and not conflictos and not fusionados:
+             "conflicto": conflictos, "omitido": []}[r].append(nombre)
+        if not subidos and not bajados and not conflictos:
             base = ("Conectado a Drive: todo ya estaba actualizado con la nube oficial."
                     if not errores else "Sin cambios aplicados.")
             if errores:
                 base += f" Avisos: {'; '.join(errores)}."
             return True, base
         partes = ["☁️ Sincronización con prioridad a la nube."]
-        if fusionados:
-            partes.append(f"Fusionados sin perder datos ({len(fusionados)}): {', '.join(fusionados)}.")
         if bajados:
             partes.append(f"Descargados de Drive ({len(bajados)}): {', '.join(bajados)}.")
         if conflictos:
