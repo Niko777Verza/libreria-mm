@@ -730,7 +730,7 @@ with st.sidebar:
     if st.button("🚪 Cerrar Sesión", use_container_width=True):
         cerrar_sesion()
     if st.button("🔄 Sincronizar con Drive", use_container_width=True,
-                 help="Fuerza descarga y subida inmediata de todos los datos con Google Drive"):
+                 help="Sube primero tus cambios locales a Drive (protege datos recientes); solo descarga si la nube es más nueva, con respaldo previo en data/_backup_sync/"):
         with st.spinner("Sincronizando con Drive..."):
             ok_sync, det_sync = drive_sync.sincronizacion_manual()
         st.session_state["_sync_msg"] = (ok_sync, det_sync)
