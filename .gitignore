@@ -1,4 +1,8 @@
 ﻿venv/
 __pycache__/
-- data/*.xlsx
+*.pyc
+*.pyo
 .streamlit/
+data/
+*.log
+libreria-mm/
