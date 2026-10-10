@@ -1,13 +1,18 @@
 """Sincronización persistente con Google Drive — Librería MM.
 
-Estrategia híbrida (local-first, upload-first):
+Estrategia con PRIORIDAD ABSOLUTA A LA NUBE (cloud-wins):
 - **En PC (sin secrets):** todas las funciones son no-op. Los datos viven en
   `data/` como siempre. No requiere instalar nada extra.
-- **En Streamlit Cloud (con secrets):** las acciones cotidianas guardan solo
-  en local (`data/`). El botón "🔄 Sincronizar con Drive" compara marcas de
-  tiempo y SUBE primero lo local reciente; solo descarga si Drive es
-  claramente más nuevo, siempre tras respaldar en `data/_backup_sync/`.
-  En empate gana LO LOCAL para nunca perder datos recientes.
+- **Con secrets (nube configurada):** al arrancar la app y al pulsar
+  "🔄 Sincronizar con Drive" se compara cada archivo local contra su
+  `modifiedTime` de Drive. La nube es la versión oficial:
+  - Si Drive es más reciente (o hay empate/conflicto) -> se DESCARGA,
+    siempre tras respaldar lo local en `data/_backup_sync/`.
+  - Solo se SUBE cuando lo local es claramente más reciente (venta o edición
+    posterior a la última sincronización) o cuando el archivo no existe en
+    Drive (siembra inicial).
+  - Tras cada operación se registra el estado (mtimes de ambos lados) para
+    no re-transferir lo ya igualado y resistir desfases de reloj.
 
 Autenticación: Service Account leída de `st.secrets["gcp_service_account"]`
 más el ID de carpeta en `st.secrets["GDRIVE_FOLDER_ID"]`.
@@ -16,7 +21,9 @@ Los imports de Google son perezosos para no exigir las librerías en local.
 from __future__ import annotations
 
 import io
+import hashlib
 import json
+import os
 import shutil
 from datetime import datetime, timezone
 from pathlib import Path
@@ -25,8 +32,7 @@ import streamlit as st
 
 BASE = Path(__file__).resolve().parent
 DATA_DIR = BASE / "data"
-BACKUP_DIR = DATA_DIR / "_backup_sync"  # respaldos previos a cualquier descarga
-IDS_PATH = DATA_DIR / ".drive_ids.json"  # caché fileId (local; ignorado por git vía data/*)
+IDS_PATH = DATA_DIR / ".drive_ids.json"  # caché fileId + estado de sync (ignorado por git vía data/*)
 
 ARCHIVOS_SYNC = ["inventario.xlsx", "ventas.xlsx", "deudores.xlsx",
                  "usuarios.xlsx", "categorias.txt", "categorias_ocultas.txt"]
@@ -76,18 +82,47 @@ def _servicio():
 
 
 def _ids() -> dict:
-    try:
-        return json.loads(IDS_PATH.read_text(encoding="utf-8"))
-    except (OSError, ValueError):
-        return {}
+    return _cargar_store().get("ids", {})
 
 
 def _guardar_ids(d: dict) -> None:
+    store = _cargar_store()
+    store["ids"] = d
+    _escribir_store(store)
+
+
+def _cargar_store() -> dict:
+    """Lee .drive_ids.json con compatibilidad hacia atrás (antes era {nombre: id})."""
+    try:
+        d = json.loads(IDS_PATH.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return {"ids": {}, "sync": {}}
+    if isinstance(d, dict) and "ids" in d:
+        d.setdefault("sync", {})
+        return d
+    if isinstance(d, dict):
+        return {"ids": d, "sync": {}}
+    return {"ids": {}, "sync": {}}
+
+
+def _escribir_store(store: dict) -> None:
     try:
         DATA_DIR.mkdir(exist_ok=True)
-        IDS_PATH.write_text(json.dumps(d), encoding="utf-8")
+        IDS_PATH.write_text(json.dumps(store), encoding="utf-8")
     except OSError:
         pass
+
+
+def _estado() -> dict:
+    """Mapa {archivo: {l: mtime_local, r: ts_remoto}} de la última sincronización."""
+    s = _cargar_store().get("sync", {})
+    return s if isinstance(s, dict) else {}
+
+
+def _guardar_estado(sync: dict) -> None:
+    store = _cargar_store()
+    store["sync"] = sync
+    _escribir_store(store)
 
 
 def _mime(nombre: str) -> str:
@@ -136,23 +171,40 @@ def _mtime_remota(meta: dict | None) -> float | None:
         return None
 
 
+def _dir_respaldos() -> Path:
+    return DATA_DIR / "_backup_sync"
+
+
 def _respaldar_local(nombre: str) -> str | None:
     """Copia de seguridad del archivo local antes de sobrescribirlo.
 
     Devuelve el nombre del respaldo o None si no había nada que respaldar.
-    Nunca lanza excepciones.
+    Conserva como máximo 20 respaldos por archivo. Nunca lanza excepciones.
     """
     try:
         origen = DATA_DIR / nombre
         if not origen.exists():
             return None
-        BACKUP_DIR.mkdir(parents=True, exist_ok=True)
+        _dir_respaldos().mkdir(parents=True, exist_ok=True)
         sello = datetime.now().strftime("%Y%m%d_%H%M%S")
-        destino = BACKUP_DIR / f"{nombre}.{sello}.bak"
+        destino = _dir_respaldos() / f"{nombre}.{sello}.bak"
         shutil.copy2(origen, destino)
+        _podar_respaldos(nombre)
         return destino.name
     except OSError:
         return None
+
+
+def _podar_respaldos(nombre: str, mantener: int = 20) -> None:
+    try:
+        cands = sorted(_dir_respaldos().glob(f"{nombre}.*.bak"))
+        for viejo in cands[:-mantener] if len(cands) > mantener else []:
+            try:
+                viejo.unlink()
+            except OSError:
+                pass
+    except OSError:
+        pass
 
 
 def subir(nombre: str) -> bool:
@@ -208,41 +260,117 @@ def descargar(nombre: str) -> bool:
     return True
 
 
+def _hash_local(nombre: str) -> str | None:
+    try:
+        return hashlib.sha256((DATA_DIR / nombre).read_bytes()).hexdigest()
+    except OSError:
+        return None
+
+
+def _marcar(service, folder: str, nombre: str) -> None:
+    """Registra el estado post-sync y alinea el mtime local con el remoto.
+
+    Alinear relojes evita re-transferencias y resiste desfases de reloj entre
+    la PC y Google. Nunca lanza (es solo optimización).
+    """
+    try:
+        meta = _meta_remota(service, folder, nombre)
+        rts = _mtime_remota(meta)
+        if rts:
+            try:
+                os.utime(DATA_DIR / nombre, (rts, rts))
+            except OSError:
+                pass
+        sync = _estado()
+        sync[nombre] = {"l": _mtime_local(nombre), "r": rts, "h": _hash_local(nombre)}
+        _guardar_estado(sync)
+    except Exception:
+        pass
+
+
+def _sincronizar_uno(service, folder: str, nombre: str) -> str:
+    """Sincroniza un archivo con PRIORIDAD A LA NUBE.
+
+    Devuelve: "subido" | "descargado" | "igual" | "omitido" | "conflicto".
+    - "conflicto": ambos lados cambiaron -> se respalda y GANA LA NUBE.
+    - Sin registro previo (primera vez): gana el más reciente por timestamp
+      absoluto; en empate gana la nube. Lo local obsoleto jamás sube.
+    """
+    lts = _mtime_local(nombre)
+    meta = _meta_remota(service, folder, nombre)
+    rts = _mtime_remota(meta)
+
+    if meta is None and lts is None:
+        return "omitido"
+    if meta is None:
+        subir(nombre)  # siembra: solo existe local
+        _marcar(service, folder, nombre)
+        return "subido"
+    if lts is None:
+        descargar(nombre)  # solo existe en la nube
+        _marcar(service, folder, nombre)
+        return "descargado"
+    if rts is None:
+        subir(nombre)  # sin fecha remota confiable: no se puede probar obsolescencia
+        _marcar(service, folder, nombre)
+        return "subido"
+
+    rec = _estado().get(nombre)
+    if rec is None:
+        # Bootstrap: comparación absoluta; empate -> nube.
+        assert lts is not None
+        if lts - rts > TOLERANCIA_SEG:
+            subir(nombre)
+            _marcar(service, folder, nombre)
+            return "subido"
+        _respaldar_local(nombre)
+        descargar(nombre)
+        _marcar(service, folder, nombre)
+        return "descargado"
+
+    try:
+        # Cambio local: mtime distinto O contenido distinto (el hash cubre
+        # ediciones dentro de la ventana de tolerancia del reloj).
+        cambio_local = abs(lts - float(rec.get("l", lts))) > TOLERANCIA_SEG
+        if not cambio_local and rec.get("h"):
+            cambio_local = _hash_local(nombre) != rec.get("h")
+        cambio_remoto = abs(rts - float(rec.get("r", rts))) > TOLERANCIA_SEG
+    except (TypeError, ValueError):
+        cambio_local = cambio_remoto = True
+
+    if not cambio_local and not cambio_remoto:
+        return "igual"
+    if cambio_remoto and not cambio_local:
+        _respaldar_local(nombre)
+        descargar(nombre)
+        _marcar(service, folder, nombre)
+        return "descargado"
+    if cambio_local and not cambio_remoto:
+        subir(nombre)
+        _marcar(service, folder, nombre)
+        return "subido"
+    # Conflicto real: cambió en ambos lados -> respalda y GANA LA NUBE.
+    _respaldar_local(nombre)
+    descargar(nombre)
+    _marcar(service, folder, nombre)
+    return "conflicto"
+
+
 def sincronizar_inicio() -> str:
     """Punto de entrada al arrancar la app. Devuelve 'nube' o 'local'.
 
-    Regla local-first con comparación por timestamps (nunca pierde datos):
-    - Si solo existe de un lado, se copia hacia el otro (siembra).
-    - Si existe en ambos, gana el más reciente; en empate gana LO LOCAL.
-    - Solo se descarga cuando Drive es claramente más nuevo (> tolerancia),
-      y siempre tras respaldar el archivo local en data/_backup_sync/.
-    Nunca interrumpe la app: ante cualquier error retorna 'local'.
+    Aplica prioridad-nube por archivo (ver _sincronizar_uno): al abrir, la
+    interfaz ya refleja los datos oficiales de Drive. Nunca interrumpe la app.
     """
     if not modo_nube():
         return "local"
     try:
         cfg = _leer_secrets()
+        assert cfg is not None
         service = _servicio()
         for nombre in ARCHIVOS_SYNC:
             try:
-                local_mtime = _mtime_local(nombre)
-                meta = _meta_remota(service, cfg["folder"], nombre)  # type: ignore[union-attr]
-                remote_mtime = _mtime_remota(meta)
-                if local_mtime is None and meta is None:
-                    continue
-                if local_mtime is not None and meta is None:
-                    subir(nombre)
-                elif local_mtime is None and meta is not None:
-                    descargar(nombre)
-                elif local_mtime is not None and remote_mtime is not None:
-                    if local_mtime >= remote_mtime - TOLERANCIA_SEG:
-                        subir(nombre)  # local más nuevo o empate -> nube se actualiza
-                    else:
-                        _respaldar_local(nombre)
-                        descargar(nombre)
-                elif local_mtime is not None:
-                    # Sin timestamp remoto confiable: no se arriesga descarga.
-                    subir(nombre)
+                _sincronizar_uno(service, cfg["folder"], nombre)
             except Exception:
                 continue
         return "nube"
@@ -254,14 +382,14 @@ def sincronizar_inicio() -> str:
 def sincronizacion_manual() -> tuple[bool, str]:
     """Sincronización manual del botón "🔄 Sincronizar con Drive". Nunca lanza.
 
-    Dirección prioritaria: SUBIR (upload-first, local-first).
-    1) Por cada archivo compara mtime local vs. modifiedTime de Drive.
-    2) Si lo local es más reciente o igual (tolerancia incluida) -> SUBE.
-       La nube se actualiza con lo último que hizo el usuario. Nunca se
-       descarga encima de un archivo local reciente.
-    3) Solo descarga cuando Drive es claramente más nuevo, y SIEMPRE tras
-       crear un respaldo en data/_backup_sync/ para no perder nada.
-    4) Si no hay remoto, siembra (sube); si no hay local, descarga (nada que perder).
+    Dirección prioritaria: DESCARGA (la nube es la versión oficial).
+    1) Por cada archivo compara estado local vs. Drive (timestamps + registro).
+    2) Drive más reciente, empate o conflicto -> se DESCARGA tras respaldar
+       lo local en data/_backup_sync/. Lo local obsoleto jamás sobrescribe.
+    3) Solo se SUBE lo local claramente más reciente o si el archivo no
+       existe en Drive (siembra).
+    4) Lo ya igualado se omite (sin tráfico innecesario).
+    La interfaz refleja lo descargado de inmediato (el llamador limpia caché).
     Devuelve (ok, mensaje_para_mostrar).
     """
     if not modo_nube():
@@ -270,63 +398,31 @@ def sincronizacion_manual() -> tuple[bool, str]:
         cfg = _leer_secrets()
         assert cfg is not None
         service = _servicio()
-        subidos, bajados, respaldos, iguales, errores = [], [], [], [], []
+        subidos, bajados, iguales, conflictos, errores = [], [], [], [], []
         for nombre in ARCHIVOS_SYNC:
             try:
-                local_mtime = _mtime_local(nombre)
-                try:
-                    meta = _meta_remota(service, cfg["folder"], nombre)
-                except Exception as e:  # error de red/API en este archivo
-                    errores.append(f"{nombre} (Drive: {e})")
-                    continue
-                remote_mtime = _mtime_remota(meta)
-
-                if local_mtime is None and meta is None:
-                    continue  # no existe en ningún lado
-                if local_mtime is not None and meta is None:
-                    # Siembra inicial: solo existe local -> subir, jamás borrar.
-                    if subir(nombre):
-                        subidos.append(nombre)
-                    continue
-                if local_mtime is None and meta is not None:
-                    # Solo existe en la nube y nada local que perder -> descargar.
-                    if descargar(nombre):
-                        bajados.append(nombre)
-                    continue
-                # Existe en ambos: decide por timestamps, empate -> LOCAL.
-                if remote_mtime is None:
-                    # Sin fecha remota confiable: proteger lo local, solo subir.
-                    if subir(nombre):
-                        subidos.append(nombre)
-                    continue
-                assert local_mtime is not None
-                if local_mtime >= remote_mtime - TOLERANCIA_SEG:
-                    if subir(nombre):
-                        subidos.append(nombre)
-                    else:
-                        iguales.append(nombre)
-                else:
-                    # Drive claramente más nuevo: respaldar antes de tocar lo local.
-                    bak = _respaldar_local(nombre)
-                    if bak:
-                        respaldos.append(f"{nombre}→{bak}")
-                    if descargar(nombre):
-                        bajados.append(nombre)
+                r = _sincronizar_uno(service, cfg["folder"], nombre)
             except Exception as e:  # noqa: BLE001 — un archivo no frena los demás
                 errores.append(f"{nombre} ({e})")
                 continue
-        if not subidos and not bajados:
-            base = "Conectado a Drive: todo ya estaba actualizado (gana lo más reciente)."
+            {"subido": subidos, "descargado": bajados, "igual": iguales,
+             "conflicto": conflictos, "omitido": []}[r].append(nombre)
+        if not subidos and not bajados and not conflictos:
+            base = ("Conectado a Drive: todo ya estaba actualizado con la nube oficial."
+                    if not errores else "Sin cambios aplicados.")
             if errores:
                 base += f" Avisos: {'; '.join(errores)}."
             return True, base
-        partes = [f"☁️ Sincronización protegida (local primero)."]
-        if subidos:
-            partes.append(f"Subidos a Drive ({len(subidos)}): {', '.join(subidos)}.")
+        partes = ["☁️ Sincronización con prioridad a la nube."]
         if bajados:
             partes.append(f"Descargados de Drive ({len(bajados)}): {', '.join(bajados)}.")
-        if respaldos:
-            partes.append(f"Respaldos locales previos en data/_backup_sync/ ({len(respaldos)}).")
+        if conflictos:
+            partes.append(f"Conflictos resueltos a favor de la nube ({len(conflictos)}): "
+                          f"{', '.join(conflictos)} (respaldo previo en data/_backup_sync/).")
+        if subidos:
+            partes.append(f"Subidos a Drive ({len(subidos)}): {', '.join(subidos)}.")
+        if iguales:
+            partes.append(f"Sin cambios ({len(iguales)}).")
         if errores:
             partes.append(f"Avisos: {'; '.join(errores)}.")
         return True, " ".join(partes)

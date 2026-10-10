@@ -676,8 +676,9 @@ if "pagina" not in st.session_state:
 if st.session_state.pagina == "📊 Dashboard":  # migración desde el nombre anterior
     st.session_state.pagina = "📊 Panel Principal"
 
-# Los datos se leen/escriben solo en local (data/). La nube se sincroniza
-# exclusivamente con el botón manual "🔄 Sincronizar con Drive" del sidebar.
+# Sincronización inicial con PRIORIDAD A LA NUBE: al abrir, la interfaz refleja
+# los datos oficiales de Drive (lo local obsoleto se respalda, jamás sube).
+drive_sync.sincronizar_inicio()
 inv = cargar_inventario()
 ventas = cargar_ventas()
 deud = cargar_deudores()
