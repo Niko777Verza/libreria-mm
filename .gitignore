@@ -3,6 +3,7 @@ __pycache__/
 *.pyc
 *.pyo
 .streamlit/
-data/
+data/*
+!data/.gitkeep
 *.log
 libreria-mm/
