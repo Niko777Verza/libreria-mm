@@ -11,6 +11,7 @@ import io
 import os
 import re
 import threading
+import time
 from datetime import date, datetime
 from pathlib import Path
 
@@ -36,7 +37,7 @@ CATEGORIA_DEFECTO = "Otros"  # Categoría de respaldo: nunca se puede borrar
 
 MARGEN = 1.5  # CORRECCIÓN 4: Precio_Sugerido = Costo de Compra * 1.5 (nunca desde venta)
 CATEGORIAS_DEFAULT = ["Libros", "Útiles", "Fotocopias", "Servicios", "Juguetes", "Regalería", "Otros"]
-METODOS_PAGO = ["Efectivo", "Tarjeta", "Transferencia", "Cuenta corriente", "Otro"]
+METODOS_PAGO = ["Efectivo", "Tarjeta", "Transferencia", "Otro"]
 CAJAS = ["Caja 1", "Caja 2"]
 
 COL_INV = ["SKU", "Nombre", "Categoria", "Costo", "Precio_Sugerido",
@@ -248,7 +249,7 @@ def _guardar_excel(df: pd.DataFrame, path: Path, hoja: str) -> None:
         raise
 
 
-@st.cache_data(ttl=120)
+@st.cache_data(ttl=60)
 def cargar_inventario() -> pd.DataFrame:
     df = _leer_excel_seguro(INV_PATH, "Inventario", df_vacio_inv())
     if len(df):
@@ -263,7 +264,7 @@ def cargar_inventario() -> pd.DataFrame:
     return df
 
 
-@st.cache_data(ttl=120)
+@st.cache_data(ttl=60)
 def cargar_ventas() -> pd.DataFrame:
     df = _leer_excel_seguro(VENTAS_PATH, "Ventas", df_vacio_ventas())
     if len(df):
@@ -274,7 +275,7 @@ def cargar_ventas() -> pd.DataFrame:
     return df
 
 
-@st.cache_data(ttl=120)
+@st.cache_data(ttl=60)
 def cargar_deudores() -> pd.DataFrame:
     df = _leer_excel_seguro(DEUD_PATH, "Deudores", df_vacio_deud())
     if len(df):
@@ -326,7 +327,7 @@ def df_vacio_usu() -> pd.DataFrame:
     return pd.DataFrame(columns=COL_USU)
 
 
-@st.cache_data(ttl=120)
+@st.cache_data(ttl=60)
 def cargar_usuarios() -> pd.DataFrame:
     df = _leer_excel_seguro(USU_PATH, "Usuarios", df_vacio_usu())
     if len(df):
@@ -698,7 +699,20 @@ if "pagina" not in st.session_state:
 if st.session_state.pagina == "📊 Dashboard":  # migración desde el nombre anterior
     st.session_state.pagina = "📊 Panel Principal"
 
-# Inicializar superusuario inicial si el sistema es nuevo
+# Sincronización inicial con PRIORIDAD A LA NUBE: al abrir, la interfaz refleja
+# los datos oficiales de Drive (lo local obsoleto se respalda, jamás sube).
+# Se ejecuta COMO MÁXIMO 1 vez cada 10 min (típicamente 1 por sesión): hacerla
+# en cada rerun colgaba cada clic ("Agregar al ticket", cambio de menú) con
+# llamadas de red a Drive. El resto de la navegación trabaja 100% en local.
+_sync_ahora = time.time()
+if _sync_ahora - float(st.session_state.get("_sync_inicio_ts", 0)) > 600:
+    drive_sync.sincronizar_inicio()
+    st.session_state["_sync_inicio_ts"] = _sync_ahora
+    st.cache_data.clear()  # lo recién descargado debe verse de inmediato
+inv = cargar_inventario()
+ventas = cargar_ventas()
+deud = cargar_deudores()
+usuarios = cargar_usuarios()
 asegurar_superusuario()
 
 # ------------------------------------------------------- Puerta de seguridad
@@ -729,22 +743,9 @@ if not st.session_state.auth:
                     st.error("Documento, contraseña o usuario inactivo incorrectos.")
     st.stop()
 
-# Sincronización inicial con Drive: se ejecuta UNA SOLA VEZ por sesión (evita latencia en cada click)
-if "_sync_inicio_hecha" not in st.session_state:
-    if drive_sync.modo_nube():
-        with st.spinner("Sincronizando con Google Drive..."):
-            drive_sync.sincronizar_inicio()
-    else:
-        drive_sync.sincronizar_inicio()
-    st.session_state["_sync_inicio_hecha"] = True
-
 # Carga de inventario base (necesario para badge de alertas en sidebar y categorías)
-inv = cargar_inventario()
+# (ventas/deud/usuarios ya se cargaron arriba, antes del login).
 CATEGORIAS = obtener_categorias(inv)
-
-# Carga bajo demanda (Lazy Loading): evita leer Excel innecesarios en pestañas que no los usan
-ventas = cargar_ventas() if st.session_state.pagina in ("📊 Panel Principal", "🧾 Ventas y Caja", "🔄 Importar / Exportar", "📈 Reportes") else None
-deud = cargar_deudores() if st.session_state.pagina in ("🤝 Deudores", "🔄 Importar / Exportar") else None
 
 # ------------------------------------------------------------------ Sidebar
 MENU_COMPLETO = ["📊 Panel Principal", "📦 Inventario", "🧾 Ventas y Caja",
@@ -763,7 +764,7 @@ with st.sidebar:
     if st.button("🚪 Cerrar Sesión", use_container_width=True):
         cerrar_sesion()
     if st.button("🔄 Sincronizar con Drive", use_container_width=True,
-                 help="Sube primero tus cambios locales a Drive (protege datos recientes); solo descarga si la nube es más nueva, con respaldo previo en data/_backup_sync/"):
+                 help="Descarga la versión oficial de Drive (prioridad a la nube); lo local se respalda en data/_backup_sync/ antes de sobrescribir"):
         with st.spinner("Sincronizando con Drive..."):
             ok_sync, det_sync = drive_sync.sincronizacion_manual()
         st.session_state["_sync_msg"] = (ok_sync, det_sync)
@@ -1098,6 +1099,24 @@ elif pg == "🧾 Ventas y Caja":
             st.session_state.auto_print_ticket = False
             st.success(f"✅ Venta {t['id']} registrada por {fmt_gs(t['total'])} "
                        f"({t['metodo']} · {t['caja']}). Stock descontado.")
+            # Estado del respaldo post-cobro a Drive (no bloqueante: el cobro
+            # ya está a salvo en local; esto solo informa la subida en fondo).
+            if drive_sync.modo_nube():
+                _est = drive_sync.estado_ultimo_respaldo()
+                try:
+                    _ts_ticket = datetime.strptime(
+                        str(t.get("fecha", "")), "%Y-%m-%d %H:%M").timestamp()
+                except (ValueError, TypeError):
+                    _ts_ticket = 0.0
+                if _est and float(_est.get("ts", 0)) >= _ts_ticket - 5:
+                    if _est.get("ok"):
+                        st.caption(f"☁️ Respaldo en Drive completado: {_est.get('detalle', '')}")
+                    else:
+                        st.warning("⚠️ No se pudo respaldar en Drive en 2do plano "
+                                   f"({_est.get('detalle', 'sin detalle')}). Usa el botón "
+                                   "«🔄 Sincronizar con Drive» como respaldo.")
+                elif st.session_state.get("_respaldo_lanzado"):
+                    st.caption("☁️ Respaldando ventas y stock en Drive en 2do plano…")
             components.html(ticket_a_html_doc(t, auto_print=auto),
                             height=min(620, 300 + 44 * max(len(t["items"]), 1)),
                             scrolling=True)
@@ -1215,6 +1234,13 @@ elif pg == "🧾 Ventas y Caja":
                         base.loc[it["SKU"], "Stock_Actual"] = max(
                             0, int(base.loc[it["SKU"], "Stock_Actual"]) - int(it["Cantidad"]))
                 guardar_inventario(base.reset_index())
+                # Respaldo inmediato en la nube (solo ventas+stock, en 2do plano
+                # para no bloquear). El botón manual queda como respaldo.
+                try:
+                    st.session_state["_respaldo_lanzado"] = bool(
+                        drive_sync.respaldo_venta_fondo())
+                except Exception:
+                    st.session_state["_respaldo_lanzado"] = False
                 st.session_state.carrito = []
                 # Guardar ticket y disparar la impresión del navegador una vez
                 st.session_state.ultimo_ticket = {

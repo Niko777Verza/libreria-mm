@@ -13,6 +13,10 @@ Estrategia con PRIORIDAD ABSOLUTA A LA NUBE (cloud-wins):
     Drive (siembra inicial).
   - Tras cada operación se registra el estado (mtimes de ambos lados) para
     no re-transferir lo ya igualado y resistir desfases de reloj.
+- **Respaldo post-cobro:** al confirmar un ticket, la app guarda en local y
+  lanza `respaldo_venta_fondo()`: solo `ventas.xlsx` + `inventario.xlsx` suben
+  en un hilo daemon (sin bloquear la UI) y dejan constancia en
+  `data/.respaldo_estado.json` para mostrar su resultado.
 
 Autenticación: Service Account leída de `st.secrets["gcp_service_account"]`
 más el ID de carpeta en `st.secrets["GDRIVE_FOLDER_ID"]`.
@@ -25,6 +29,7 @@ import hashlib
 import json
 import os
 import shutil
+import threading
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -36,6 +41,9 @@ IDS_PATH = DATA_DIR / ".drive_ids.json"  # caché fileId + estado de sync (ignor
 
 ARCHIVOS_SYNC = ["inventario.xlsx", "ventas.xlsx", "deudores.xlsx",
                  "usuarios.xlsx", "categorias.txt", "categorias_ocultas.txt"]
+# Subconjunto crítico que se respalda solo tras cada cobro (rápido y selectivo).
+ARCHIVOS_VENTA = ["ventas.xlsx", "inventario.xlsx"]
+ESTADO_RESPALDO_PATH = DATA_DIR / ".respaldo_estado.json"  # {ok, ts, detalle}
 MIMETYPES = {".xlsx": "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
              ".txt": "text/plain"}
 SCOPES = ["https://www.googleapis.com/auth/drive"]
@@ -71,13 +79,18 @@ def estado_almacenamiento() -> str:
 
 @st.cache_resource
 def _servicio():
-    from google.oauth2 import service_account
-    from googleapiclient.discovery import build
-
     cfg = _leer_secrets()
     if not cfg:
         raise RuntimeError("Sin credenciales de Google Drive en st.secrets.")
-    creds = service_account.Credentials.from_service_account_info(cfg["sa"], scopes=SCOPES)
+    return _servicio_con(cfg["sa"])
+
+
+def _servicio_con(sa: dict):
+    """Construye el cliente de Drive sin tocar st (apto para hilos secundarios)."""
+    from google.oauth2 import service_account
+    from googleapiclient.discovery import build
+
+    creds = service_account.Credentials.from_service_account_info(sa, scopes=SCOPES)
     return build("drive", "v3", credentials=creds, cache_discovery=False)
 
 
@@ -233,6 +246,31 @@ def _podar_respaldos(nombre: str, mantener: int = 20) -> None:
         pass
 
 
+def _subir_con(service, folder: str, nombre: str) -> str | None:
+    """Núcleo de subida con un servicio ya construido. Devuelve fileId o None."""
+    local = DATA_DIR / nombre
+    if not local.exists():
+        return None
+    from googleapiclient.http import MediaFileUpload
+
+    ids = _ids()
+    fid = ids.get(nombre) or _id_en_drive(service, folder, nombre)
+    media = MediaFileUpload(str(local), mimetype=_mime(nombre), resumable=False)
+    if fid:
+        service.files().update(fileId=fid, media_body=media,
+                               supportsAllDrives=True).execute()
+    else:
+        creado = service.files().create(
+            body={"name": nombre, "parents": [folder]},
+            media_body=media, fields="id",
+            supportsAllDrives=True).execute()
+        fid = creado["id"]
+    ids[nombre] = fid
+    _guardar_ids(ids)
+    _CACHE_METAS.pop(nombre, None)  # invalidar precarga (el id/ts cambiaron)
+    return fid
+
+
 def subir(nombre: str) -> bool:
     """Sube (crea o sobrescribe) un archivo de data/ a la carpeta de Drive."""
     cfg = _leer_secrets()
@@ -241,25 +279,7 @@ def subir(nombre: str) -> bool:
     local = DATA_DIR / nombre
     if not local.exists():
         return False
-    from googleapiclient.http import MediaFileUpload
-
-    service = _servicio()
-    ids = _ids()
-    fid = ids.get(nombre) or _id_en_drive(service, cfg["folder"], nombre)
-    media = MediaFileUpload(str(local), mimetype=_mime(nombre), resumable=False)
-    if fid:
-        service.files().update(fileId=fid, media_body=media,
-                               supportsAllDrives=True).execute()
-    else:
-        creado = service.files().create(
-            body={"name": nombre, "parents": [cfg["folder"]]},
-            media_body=media, fields="id",
-            supportsAllDrives=True).execute()
-        fid = creado["id"]
-    ids[nombre] = fid
-    _guardar_ids(ids)
-    _CACHE_METAS.pop(nombre, None)
-    return True
+    return _subir_con(_servicio(), cfg["folder"], nombre) is not None
 
 
 def descargar(nombre: str) -> bool:
@@ -314,6 +334,71 @@ def _marcar(service, folder: str, nombre: str) -> None:
         _guardar_estado(sync)
     except Exception:
         pass
+
+
+def _escribir_estado_respaldo(ok: bool, detalle: str) -> None:
+    """Deja constancia del último respaldo post-cobro (la UI la muestra sin bloquear)."""
+    try:
+        DATA_DIR.mkdir(exist_ok=True)
+        ESTADO_RESPALDO_PATH.write_text(
+            json.dumps({"ok": ok, "ts": datetime.now(timezone.utc).timestamp(),
+                        "detalle": detalle}, ensure_ascii=False),
+            encoding="utf-8")
+    except OSError:
+        pass
+
+
+def estado_ultimo_respaldo() -> dict | None:
+    """Lee la constancia del último respaldo post-cobro, o None si nunca hubo."""
+    try:
+        d = json.loads(ESTADO_RESPALDO_PATH.read_text(encoding="utf-8"))
+        return d if isinstance(d, dict) else None
+    except (OSError, ValueError):
+        return None
+
+
+def _respaldar_venta_en_hilo(cfg: dict) -> None:
+    """Trabajo del hilo secundario: sube ventas+stock y registra estado. Nunca lanza."""
+    try:
+        service = _servicio_con(cfg["sa"])
+        subidos, errores = [], []
+        for nombre in ARCHIVOS_VENTA:
+            try:
+                if _subir_con(service, cfg["folder"], nombre) is None:
+                    errores.append(f"{nombre} (sin archivo local)")
+                    continue
+                _marcar(service, cfg["folder"], nombre)
+                subidos.append(nombre)
+            except Exception as e:  # noqa: BLE001 — un archivo no frena al otro
+                errores.append(f"{nombre} ({e})")
+        if errores and not subidos:
+            _escribir_estado_respaldo(False, "; ".join(errores))
+        else:
+            detalle = f"Subidos: {', '.join(subidos)}" + (
+                f". Avisos: {'; '.join(errores)}" if errores else "")
+            _escribir_estado_respaldo(True, detalle)
+    except Exception as e:  # noqa: BLE001 — p. ej. sin red al momento del cobro
+        _escribir_estado_respaldo(False, str(e))
+
+
+def respaldo_venta_fondo() -> bool:
+    """Lanza el respaldo post-cobro (ventas+stock) en un hilo daemon. Nunca lanza.
+
+    No bloquea la interfaz: el cobro ya quedó guardado en local y la subida
+    corre en segundo plano con su propio cliente de Drive (sin tocar `st`).
+    El botón manual sigue disponible como respaldo. Devuelve True si el hilo
+    fue lanzado (hay nube configurada), False si es no-op local.
+    """
+    try:
+        cfg = _leer_secrets()
+        if not cfg:
+            return False
+        hilo = threading.Thread(target=_respaldar_venta_en_hilo, args=(cfg,),
+                                name="respaldo-drive-venta", daemon=True)
+        hilo.start()
+        return True
+    except Exception:
+        return False
 
 
 def _sincronizar_uno(service, folder: str, nombre: str) -> str:
