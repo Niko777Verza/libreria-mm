@@ -8,7 +8,9 @@ from __future__ import annotations
 import hashlib
 import html
 import io
+import os
 import re
+import threading
 from datetime import date, datetime
 from pathlib import Path
 
@@ -35,7 +37,7 @@ CATEGORIA_DEFECTO = "Otros"  # Categoría de respaldo: nunca se puede borrar
 MARGEN = 1.5  # CORRECCIÓN 4: Precio_Sugerido = Costo de Compra * 1.5 (nunca desde venta)
 CATEGORIAS_DEFAULT = ["Libros", "Útiles", "Fotocopias", "Servicios", "Juguetes", "Regalería", "Otros"]
 METODOS_PAGO = ["Efectivo", "Tarjeta", "Transferencia", "Cuenta corriente", "Otro"]
-CAJAS = ["Caja 1", "Caja 2", "Caja 3"]
+CAJAS = ["Caja 1", "Caja 2"]
 
 COL_INV = ["SKU", "Nombre", "Categoria", "Costo", "Precio_Sugerido",
            "Precio_Actual", "Stock_Actual", "Stock_Minimo", "Fecha_Actualizacion"]
@@ -51,6 +53,9 @@ ROLES = ["SuperUsuario", "Admin", "Cajero"]
 SUPER_DOC = "5729679"
 SUPER_NOMBRE = "Cesar Verza"
 SUPER_PASS = "Nicolas08.L"
+
+FILL_ENCABEZADO = PatternFill("solid", fgColor="1F4E79")
+FONT_ENCABEZADO = Font(bold=True, color="FFFFFF", size=11)
 
 st.set_page_config(page_title="Librería MM", page_icon="📚", layout="wide")
 
@@ -100,23 +105,30 @@ def recalcular_sugerido(costo) -> int:
 
 
 # ------------------------------------------------- Categorías dinámicas (2)
-def _categorias_guardadas() -> list[str]:
+@st.cache_data(ttl=300)
+def _categorias_disco() -> tuple[list[str], list[str]]:
+    guardadas = []
     if CAT_PATH.exists():
         try:
-            return [l.strip() for l in CAT_PATH.read_text(encoding="utf-8").splitlines() if l.strip()]
+            guardadas = [l.strip() for l in CAT_PATH.read_text(encoding="utf-8").splitlines() if l.strip()]
         except OSError:
-            return []
-    return []
+            guardadas = []
+    ocultas = []
+    if CAT_HIDE_PATH.exists():
+        try:
+            ocultas = [l.strip() for l in CAT_HIDE_PATH.read_text(encoding="utf-8").splitlines() if l.strip()]
+        except OSError:
+            ocultas = []
+    return guardadas, ocultas
+
+
+def _categorias_guardadas() -> list[str]:
+    return list(_categorias_disco()[0])
 
 
 def _categorias_ocultas() -> list[str]:
     """Categorías predeterminadas que el usuario borró (para no volver a mostrarlas)."""
-    if CAT_HIDE_PATH.exists():
-        try:
-            return [l.strip() for l in CAT_HIDE_PATH.read_text(encoding="utf-8").splitlines() if l.strip()]
-        except OSError:
-            return []
-    return []
+    return list(_categorias_disco()[1])
 
 
 def guardar_nueva_categoria(nombre: str) -> bool:
@@ -133,6 +145,7 @@ def guardar_nueva_categoria(nombre: str) -> bool:
     extras = _categorias_guardadas()
     extras.append(nombre)
     CAT_PATH.write_text("\n".join(sorted(set(extras))), encoding="utf-8")
+    _categorias_disco.clear()
     return True
 
 
@@ -161,7 +174,8 @@ def eliminar_categoria(nombre: str) -> tuple[bool, int]:
     if nombre.lower() in {c.lower() for c in CATEGORIAS_DEFAULT}:
         ocultas = _categorias_ocultas() + [nombre]
         CAT_HIDE_PATH.write_text("\n".join(sorted(set(ocultas))), encoding="utf-8")
-    st.cache_data.clear()
+    _categorias_disco.clear()
+    cargar_inventario.clear()
     return True, n
 
 
@@ -213,20 +227,28 @@ def _leer_excel_seguro(path: Path, hoja: str, vacio: pd.DataFrame) -> pd.DataFra
 
 def _guardar_excel(df: pd.DataFrame, path: Path, hoja: str) -> None:
     DATA_DIR.mkdir(exist_ok=True)
-    with pd.ExcelWriter(path, engine="openpyxl") as w:
-        df.to_excel(w, sheet_name=hoja, index=False)
-        ws = w.sheets[hoja]
-        for col in ws.columns:
-            ancho = max((len(str(c.value)) if c.value is not None else 0) for c in col) + 2
-            ws.column_dimensions[col[0].column_letter].width = min(ancho, 46)
-        for cell in ws[1]:
-            cell.fill = FILL_ENCABEZADO
-            cell.font = FONT_ENCABEZADO
-            cell.alignment = Alignment(horizontal="center", vertical="center")
-        ws.freeze_panes = "A2"
+    temp_path = path.with_name(f"{path.stem}.tmp_{os.getpid()}_{threading.get_ident()}.xlsx")
+    try:
+        with pd.ExcelWriter(temp_path, engine="openpyxl") as w:
+            df.to_excel(w, sheet_name=hoja, index=False)
+            ws = w.sheets[hoja]
+            for cell in ws[1]:
+                cell.fill = FILL_ENCABEZADO
+                cell.font = FONT_ENCABEZADO
+                cell.alignment = Alignment(horizontal="center", vertical="center")
+            ws.freeze_panes = "A2"
+        # Reemplazo atómico para máxima seguridad ante cortes/fallos
+        os.replace(temp_path, path)
+    except Exception:
+        if temp_path.exists():
+            try:
+                temp_path.unlink()
+            except OSError:
+                pass
+        raise
 
 
-@st.cache_data(ttl=5)
+@st.cache_data(ttl=120)
 def cargar_inventario() -> pd.DataFrame:
     df = _leer_excel_seguro(INV_PATH, "Inventario", df_vacio_inv())
     if len(df):
@@ -241,7 +263,7 @@ def cargar_inventario() -> pd.DataFrame:
     return df
 
 
-@st.cache_data(ttl=5)
+@st.cache_data(ttl=120)
 def cargar_ventas() -> pd.DataFrame:
     df = _leer_excel_seguro(VENTAS_PATH, "Ventas", df_vacio_ventas())
     if len(df):
@@ -252,7 +274,7 @@ def cargar_ventas() -> pd.DataFrame:
     return df
 
 
-@st.cache_data(ttl=5)
+@st.cache_data(ttl=120)
 def cargar_deudores() -> pd.DataFrame:
     df = _leer_excel_seguro(DEUD_PATH, "Deudores", df_vacio_deud())
     if len(df):
@@ -274,7 +296,7 @@ def guardar_inventario(df: pd.DataFrame) -> None:
     for c in df["Categoria"].dropna().unique().tolist():
         guardar_nueva_categoria(str(c))
     _guardar_excel(df[COL_INV], INV_PATH, "Inventario")
-    st.cache_data.clear()
+    cargar_inventario.clear()
 
 
 def guardar_ventas(df: pd.DataFrame) -> None:
@@ -283,7 +305,7 @@ def guardar_ventas(df: pd.DataFrame) -> None:
     for c in ("Precio_Unitario", "Total"):
         df[c] = pd.to_numeric(df[c], errors="coerce").fillna(0).round(0).astype(int)
     _guardar_excel(df[COL_VENTAS], VENTAS_PATH, "Ventas")
-    st.cache_data.clear()
+    cargar_ventas.clear()
 
 
 def guardar_deudores(df: pd.DataFrame) -> None:
@@ -291,7 +313,7 @@ def guardar_deudores(df: pd.DataFrame) -> None:
     for c in ("Monto_Total", "Monto_Pagado", "Saldo"):
         df[c] = pd.to_numeric(df[c], errors="coerce").fillna(0).round(0).astype(int)
     _guardar_excel(df[COL_DEUD], DEUD_PATH, "Deudores")
-    st.cache_data.clear()
+    cargar_deudores.clear()
 
 
 # ------------------------------------------------- Usuarios y autenticación
@@ -304,7 +326,7 @@ def df_vacio_usu() -> pd.DataFrame:
     return pd.DataFrame(columns=COL_USU)
 
 
-@st.cache_data(ttl=5)
+@st.cache_data(ttl=120)
 def cargar_usuarios() -> pd.DataFrame:
     df = _leer_excel_seguro(USU_PATH, "Usuarios", df_vacio_usu())
     if len(df):
@@ -315,7 +337,7 @@ def cargar_usuarios() -> pd.DataFrame:
 
 def guardar_usuarios(df: pd.DataFrame) -> None:
     _guardar_excel(df[COL_USU], USU_PATH, "Usuarios")
-    st.cache_data.clear()
+    cargar_usuarios.clear()
 
 
 def asegurar_superusuario() -> None:
@@ -676,16 +698,8 @@ if "pagina" not in st.session_state:
 if st.session_state.pagina == "📊 Dashboard":  # migración desde el nombre anterior
     st.session_state.pagina = "📊 Panel Principal"
 
-# Sincronización inicial con PRIORIDAD A LA NUBE: al abrir, la interfaz refleja
-# los datos oficiales de Drive (lo local obsoleto se respalda, jamás sube).
-drive_sync.sincronizar_inicio()
-inv = cargar_inventario()
-ventas = cargar_ventas()
-deud = cargar_deudores()
-usuarios = cargar_usuarios()
+# Inicializar superusuario inicial si el sistema es nuevo
 asegurar_superusuario()
-usuarios = cargar_usuarios()
-CATEGORIAS = obtener_categorias(inv)
 
 # ------------------------------------------------------- Puerta de seguridad
 if not st.session_state.auth:
@@ -715,6 +729,23 @@ if not st.session_state.auth:
                     st.error("Documento, contraseña o usuario inactivo incorrectos.")
     st.stop()
 
+# Sincronización inicial con Drive: se ejecuta UNA SOLA VEZ por sesión (evita latencia en cada click)
+if "_sync_inicio_hecha" not in st.session_state:
+    if drive_sync.modo_nube():
+        with st.spinner("Sincronizando con Google Drive..."):
+            drive_sync.sincronizar_inicio()
+    else:
+        drive_sync.sincronizar_inicio()
+    st.session_state["_sync_inicio_hecha"] = True
+
+# Carga de inventario base (necesario para badge de alertas en sidebar y categorías)
+inv = cargar_inventario()
+CATEGORIAS = obtener_categorias(inv)
+
+# Carga bajo demanda (Lazy Loading): evita leer Excel innecesarios en pestañas que no los usan
+ventas = cargar_ventas() if st.session_state.pagina in ("📊 Panel Principal", "🧾 Ventas y Caja", "🔄 Importar / Exportar", "📈 Reportes") else None
+deud = cargar_deudores() if st.session_state.pagina in ("🤝 Deudores", "🔄 Importar / Exportar") else None
+
 # ------------------------------------------------------------------ Sidebar
 MENU_COMPLETO = ["📊 Panel Principal", "📦 Inventario", "🧾 Ventas y Caja",
                  "🤝 Deudores", "🔄 Importar / Exportar", "📈 Reportes", "👥 Usuarios"]
@@ -726,8 +757,9 @@ with st.sidebar:
     st.title("📚 Librería MM")
     st.caption("Inventario · Caja · Deudores · Gs.")
     st.caption(f"Almacenamiento: **{drive_sync.estado_almacenamiento()}**")
-    auth = st.session_state.auth
-    st.info(f"👤 **{auth['Nombre']}**\n\n🪪 {auth['Documento']} · 🎭 {auth['Rol']}")
+    auth = st.session_state.get("auth") or {}
+    if auth:
+        st.info(f"👤 **{auth.get('Nombre', '')}**\n\n🪪 {auth.get('Documento', '')} · 🎭 {auth.get('Rol', '')}")
     if st.button("🚪 Cerrar Sesión", use_container_width=True):
         cerrar_sesion()
     if st.button("🔄 Sincronizar con Drive", use_container_width=True,
@@ -857,7 +889,7 @@ elif pg == "📦 Inventario":
         if cols[1].button("➕ Añadir", type="primary", use_container_width=True):
             if guardar_nueva_categoria(nueva):
                 st.success(f"✅ Categoría «{nueva.strip()}» añadida.")
-                st.cache_data.clear()
+                cargar_inventario.clear()
                 st.rerun()
             else:
                 st.warning("Escribe un nombre válido y no repetido.")
@@ -1077,23 +1109,70 @@ elif pg == "🧾 Ventas y Caja":
                 st.session_state.ultimo_ticket = None
                 st.rerun()
             st.divider()
+        # Función auxiliar para agregar al carrito con consolidación de ítems
+        def agregar_al_carrito(sku_item: str, cant_item: int) -> tuple[bool, str]:
+            sku_clean = str(sku_item).strip()
+            if not sku_clean:
+                return False, "Ingresa un SKU o código de barras válido."
+            coincidencias = inv[inv["SKU"].astype(str) == sku_clean]
+            if len(coincidencias) == 0:
+                return False, f"El producto con código/SKU `{sku_clean}` no existe en inventario."
+            fila_prod = coincidencias.iloc[0]
+            stock_disp = int(fila_prod["Stock_Actual"])
+            cant_actual = sum(it["Cantidad"] for it in st.session_state.carrito if str(it["SKU"]) == sku_clean)
+            if stock_disp < 9000 and (cant_actual + cant_item) > stock_disp:
+                return False, (f"Stock insuficiente para {fila_prod['Nombre']}: disponible {stock_disp}, "
+                               f"en carrito {cant_actual}, intentas agregar {cant_item}.")
+            # Consolidar si ya está en el ticket
+            encontrado = False
+            for it in st.session_state.carrito:
+                if str(it["SKU"]) == sku_clean:
+                    it["Cantidad"] += cant_item
+                    encontrado = True
+                    break
+            if not encontrado:
+                st.session_state.carrito.append({
+                    "SKU": sku_clean,
+                    "Nombre": str(fila_prod["Nombre"]),
+                    "Cantidad": int(cant_item),
+                    "Precio": a_entero(fila_prod["Precio_Actual"])
+                })
+            return True, f"Agregado: {fila_prod['Nombre']} x{cant_item}"
+
         st.subheader("Armar ticket")
+
+        # Entrada rápida por lector de código de barras o SKU
+        with st.form("pos_barcode_form", clear_on_submit=True):
+            sb1, sb2, sb3 = st.columns([3, 1, 1])
+            sku_leido = sb1.text_input("⚡ Lector de código de barras / SKU rápido",
+                                       placeholder="Escanea con el lector o escribe el SKU y presiona Enter",
+                                       key="pos_sku_input")
+            cant_leida = sb2.number_input("Cant.", min_value=1, step=1, value=1, format="%d", key="pos_cant_input")
+            if sb3.form_submit_button("⚡ Agregar rápido", type="primary", use_container_width=True):
+                if sku_leido.strip():
+                    ok_b, msg_b = agregar_al_carrito(sku_leido.strip(), int(cant_leida))
+                    if ok_b:
+                        st.success(f"✅ {msg_b}")
+                        st.rerun()
+                    else:
+                        st.error(f"❌ {msg_b}")
+
+        # Selección manual desde catálogo
         c1, c2, c3 = st.columns([2, 1, 1])
-        opciones = {f"{r.SKU} — {r.Nombre} ({fmt_gs(r.Precio_Actual)}, stock {int(r.Stock_Actual)}": r.SKU
+        opciones = {f"{r.SKU} — {r.Nombre} ({fmt_gs(r.Precio_Actual)}, stock {int(r.Stock_Actual)})": r.SKU
                     for r in inv.itertuples()}
-        sel = c1.selectbox("Producto (SKU — nombre)", list(opciones.keys()))
-        cant = c2.number_input("Cantidad", min_value=1, step=1, value=1, format="%d")
+        sel = c1.selectbox("O buscar en la lista (SKU — nombre)", list(opciones.keys()))
+        cant = c2.number_input("Cantidad", min_value=1, step=1, value=1, format="%d", key="pos_manual_cant")
         sku_sel = opciones[sel]
         fila = inv[inv["SKU"] == sku_sel].iloc[0]
         c3.metric("Subtotal", fmt_gs(a_entero(fila["Precio_Actual"]) * int(cant)))
-        if st.button("➕ Agregar al ticket"):
-            if cant > int(fila["Stock_Actual"]) and int(fila["Stock_Actual"]) < 9000:
-                st.error(f"Stock insuficiente: hay {int(fila['Stock_Actual'])} y pides {cant}.")
+        if st.button("➕ Agregar al ticket", key="pos_btn_add_manual"):
+            ok_m, msg_m = agregar_al_carrito(sku_sel, int(cant))
+            if ok_m:
+                st.success(f"✅ {msg_m}")
+                st.rerun()
             else:
-                st.session_state.carrito.append(
-                    {"SKU": sku_sel, "Nombre": fila["Nombre"], "Cantidad": int(cant),
-                     "Precio": a_entero(fila["Precio_Actual"])})
-                st.success(f"Agregado: {fila['Nombre']} x{int(cant)}")
+                st.error(f"❌ {msg_m}")
         if st.session_state.carrito:
             st.divider()
             car = pd.DataFrame(st.session_state.carrito)

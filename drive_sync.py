@@ -143,15 +143,41 @@ def _mtime_local(nombre: str) -> float | None:
         return None
 
 
+_CACHE_METAS: dict[str, dict] = {}
+
+
+def _precargar_metas_remotas(service, folder: str) -> None:
+    """Precarga metadatos de todos los archivos en la carpeta de Drive en UNA sola petición HTTP."""
+    global _CACHE_METAS
+    try:
+        resp = service.files().list(
+            q=f"'{folder}' in parents and trashed = false",
+            fields="files(id, name, modifiedTime, size)", pageSize=100,
+            supportsAllDrives=True,
+            includeItemsFromAllDrives=True).execute()
+        _CACHE_METAS = {f["name"]: f for f in resp.get("files", []) if "name" in f}
+    except Exception:
+        _CACHE_METAS = {}
+
+
 def _meta_remota(service, folder: str, nombre: str) -> dict | None:
     """Metadatos remotos {id, modifiedTime, ...} o None si no existe en Drive."""
-    resp = service.files().list(
-        q=f"'{folder}' in parents and name = '{nombre}' and trashed = false",
-        fields="files(id, name, modifiedTime, size)", pageSize=5,
-        supportsAllDrives=True,
-        includeItemsFromAllDrives=True).execute()
-    files = resp.get("files", [])
-    return files[0] if files else None
+    global _CACHE_METAS
+    if nombre in _CACHE_METAS:
+        return _CACHE_METAS[nombre]
+    try:
+        resp = service.files().list(
+            q=f"'{folder}' in parents and name = '{nombre}' and trashed = false",
+            fields="files(id, name, modifiedTime, size)", pageSize=5,
+            supportsAllDrives=True,
+            includeItemsFromAllDrives=True).execute()
+        files = resp.get("files", [])
+        m = files[0] if files else None
+        if m:
+            _CACHE_METAS[nombre] = m
+        return m
+    except Exception:
+        return None
 
 
 def _mtime_remota(meta: dict | None) -> float | None:
@@ -232,6 +258,7 @@ def subir(nombre: str) -> bool:
         fid = creado["id"]
     ids[nombre] = fid
     _guardar_ids(ids)
+    _CACHE_METAS.pop(nombre, None)
     return True
 
 
@@ -257,6 +284,7 @@ def descargar(nombre: str) -> bool:
     (DATA_DIR / nombre).write_bytes(buf.getvalue())
     ids[nombre] = fid
     _guardar_ids(ids)
+    _CACHE_METAS.pop(nombre, None)
     return True
 
 
@@ -368,6 +396,7 @@ def sincronizar_inicio() -> str:
         cfg = _leer_secrets()
         assert cfg is not None
         service = _servicio()
+        _precargar_metas_remotas(service, cfg["folder"])
         for nombre in ARCHIVOS_SYNC:
             try:
                 _sincronizar_uno(service, cfg["folder"], nombre)
@@ -398,6 +427,7 @@ def sincronizacion_manual() -> tuple[bool, str]:
         cfg = _leer_secrets()
         assert cfg is not None
         service = _servicio()
+        _precargar_metas_remotas(service, cfg["folder"])
         subidos, bajados, iguales, conflictos, errores = [], [], [], [], []
         for nombre in ARCHIVOS_SYNC:
             try:
