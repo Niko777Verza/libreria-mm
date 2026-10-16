@@ -63,8 +63,26 @@ st.set_page_config(page_title="Librería MM", page_icon="📚", layout="wide")
 # Las descargas nativas de Streamlit ("Download as CSV" de tablas/gráficos) usan
 # coma como separador y Excel en español las abre en una sola columna. Se ocultan
 # y en su lugar cada sección ofrece botones propios: .xlsx o CSV con `;` y BOM.
-st.markdown("<style>div[data-testid='stElementToolbar']{display:none;}</style>",
-            unsafe_allow_html=True)
+# Además: animación de entrada para gráficos/métricas y superficies neutras que
+# mantienen contraste en modo claro Y oscuro (sin deslumbrar).
+st.markdown(
+    "<style>"
+    "div[data-testid='stElementToolbar']{display:none;}"
+    "@keyframes mm-in{from{opacity:0;transform:translateY(10px);}to{opacity:1;transform:none;}}"
+    "[data-testid='stVegaLiteChart'],[data-testid='stMetric']{animation:mm-in .45s ease both;}"
+    "[data-testid='stMetric']{background:rgba(127,127,127,.09);"
+    "border:1px solid rgba(127,127,127,.22);border-radius:14px;padding:12px 14px;}"
+    "[data-testid='stMetric'] label{font-weight:600;}"
+    "[data-testid='stMetric'] [data-testid='stMetricValue']{font-variant-numeric:tabular-nums;}"
+    "div[data-testid='stAlert']{border-radius:12px;}"
+    ".stTabs [data-baseweb='tab']{border-radius:10px 10px 0 0;}"
+    "button[kind='primary']{border-radius:10px;}"
+    "@media (prefers-color-scheme:dark){"
+    "[data-testid='stMetric']{background:rgba(255,255,255,.05);"
+    "border-color:rgba(255,255,255,.14);box-shadow:none;}"
+    "div[data-testid='stAlert']{filter:saturate(.92) brightness(.96);}"
+    "}</style>",
+    unsafe_allow_html=True)
 
 
 def csv_puntoycoma_bytes(df: pd.DataFrame) -> bytes:
@@ -414,14 +432,92 @@ def resaltar_stock(df: pd.DataFrame) -> pd.io.formats.style.Styler:
         except (ValueError, TypeError, KeyError):
             return [""] * len(row)
         if s <= m:
-            return ["background-color: #f8d7da"] * len(row)
+            return ["background-color: #f8d7da; color: #58151c"] * len(row)  # rojo + texto oscuro legible
         if m > 0 and s <= m * 1.5:
-            return ["background-color: #fff3cd"] * len(row)
+            return ["background-color: #fff3cd; color: #5a4300"] * len(row)  # amarillo + texto oscuro
         return [""] * len(row)
     cols = [c for c in COL_INV if c in df.columns]
     return df[cols].style.apply(color_fila, axis=1).format(
         {c: lambda v: fmt_gs(v) if pd.notna(v) else "" for c in ("Costo", "Precio_Sugerido", "Precio_Actual")}
     )
+
+
+def _colores_grafico() -> dict:
+    """Paleta según el tema activo (claro/oscuro) para que los gráficos lean bien."""
+    oscuro = False
+    try:
+        oscuro = st.get_option("theme.base") == "dark"
+    except Exception:
+        pass
+    return {"texto": "#e8eaed" if oscuro else "#1f2937",
+            "rejilla": "#3c4043" if oscuro else "#e5e7eb",
+            "acento": "#4da3ff" if oscuro else "#1F4E79",
+            "area": "#4da3ff" if oscuro else "#1F4E79"}
+
+
+def _base_grafico(chart, titulo: str = ""):
+    c = _colores_grafico()
+    return (chart.properties(title=titulo)
+            .configure(background="transparent")
+            .configure_title(color=c["texto"], fontSize=15, anchor="start")
+            .configure_axis(labelColor=c["texto"], titleColor=c["texto"],
+                            gridColor=c["rejilla"], labelFontSize=11)
+            .configure_legend(labelColor=c["texto"], titleColor=c["texto"])
+            .configure_view(strokeWidth=0))
+
+
+def graf_barras(datos: pd.DataFrame, etiqueta: str, valor: str, titulo: str = "",
+                horizontal: bool = False, alto: int = 300):
+    """Barras interactivas (hover con tooltip, resaltado) con formato de miles."""
+    import altair as alt
+
+    c = _colores_grafico()
+    enc = ({"y": alt.Y(f"{etiqueta}:N", sort="-x", title=None),
+            "x": alt.X(f"{valor}:Q", title="Total (Gs.)", axis=alt.Axis(format=","))}
+           if horizontal else
+           {"x": alt.X(f"{etiqueta}:N", sort="-y", title=None),
+            "y": alt.Y(f"{valor}:Q", title="Total (Gs.)", axis=alt.Axis(format=","))})
+    sel = alt.selection_point(fields=[etiqueta], on="click", clear="dblclick")
+    chart = (alt.Chart(datos).mark_bar(cornerRadiusEnd=6, color=c["acento"])
+             .encode(**enc, tooltip=[etiqueta, alt.Tooltip(valor, format=",", title="Gs.")],
+                     opacity=alt.condition(sel, alt.value(1), alt.value(0.35)))
+             .add_params(sel))
+    return _base_grafico(chart.properties(height=alto), titulo)
+
+
+def graf_dona(datos: pd.DataFrame, etiqueta: str, valor: str, titulo: str = "", alto: int = 300):
+    """Dona interactiva con tooltip y resaltado al pasar el cursor."""
+    import altair as alt
+
+    c = _colores_grafico()
+    sel = alt.selection_point(fields=[etiqueta], on="mouseover", clear="mouseout")
+    chart = (alt.Chart(datos).mark_arc(innerRadius=70, outerRadius=120, cornerRadius=5)
+             .encode(theta=alt.Theta(f"{valor}:Q"),
+                     color=alt.Color(f"{etiqueta}:N",
+                                     scale=alt.Scale(scheme="blues" if c["texto"] == "#1f2937" else "lighttealblue"),
+                                     legend=alt.Legend(title=None)),
+                     tooltip=[etiqueta, alt.Tooltip(valor, format=",", title="Gs.")],
+                     opacity=alt.condition(sel, alt.value(1), alt.value(0.45)))
+             .add_params(sel))
+    return _base_grafico(chart.properties(height=alto), titulo)
+
+
+def graf_serie(datos: pd.DataFrame, x: str, valor: str, titulo: str = "", alto: int = 320):
+    """Serie temporal con área, línea y puntos interactivos."""
+    import altair as alt
+
+    c = _colores_grafico()
+    base = alt.Chart(datos).encode(
+        x=alt.X(f"{x}:T", title=None),
+        y=alt.Y(f"{valor}:Q", title="Total (Gs.)", axis=alt.Axis(format=",")),
+        tooltip=[alt.Tooltip(f"{x}:T", title="Fecha"),
+                 alt.Tooltip(valor, format=",", title="Gs.")])
+    area = base.mark_area(opacity=0.25, color=c["area"])
+    linea = base.mark_line(color=c["acento"], strokeWidth=2.5)
+    puntos = base.mark_circle(size=70, color=c["acento"]).encode(
+        opacity=alt.condition(alt.selection_point(on="mouseover"), alt.value(1), alt.value(0.85)))
+    chart = (area + linea + puntos).interactive()
+    return _base_grafico(chart.properties(height=alto), titulo)
 
 
 def df_a_excel_bytes(hojas: dict[str, pd.DataFrame], con_totales: bool = True) -> bytes:
@@ -763,7 +859,7 @@ with st.sidebar:
         st.info(f"👤 **{auth.get('Nombre', '')}**\n\n🪪 {auth.get('Documento', '')} · 🎭 {auth.get('Rol', '')}")
     if st.button("🚪 Cerrar Sesión", use_container_width=True):
         cerrar_sesion()
-    if st.button("🔄 Sincronizar con Drive", use_container_width=True,
+    if st.button("🔄 Sincronizar", use_container_width=True,
                  help="Descarga la versión oficial de Drive (prioridad a la nube); lo local se respalda en data/_backup_sync/ antes de sobrescribir"):
         with st.spinner("Sincronizando con Drive..."):
             ok_sync, det_sync = drive_sync.sincronizacion_manual()
@@ -819,7 +915,8 @@ if pg == "📊 Panel Principal":
             if len(ult):
                 diario = ult.groupby(ult["Fecha"].dt.date)["Total"].sum().reset_index()
                 diario.columns = ["Fecha", "Total"]
-                st.bar_chart(diario.set_index("Fecha"))
+                diario["Fecha"] = pd.to_datetime(diario["Fecha"])
+                st.altair_chart(graf_serie(diario, "Fecha", "Total"), use_container_width=True)
             else:
                 st.info("Sin ventas en los últimos 14 días.")
         else:
@@ -827,10 +924,14 @@ if pg == "📊 Panel Principal":
     with col_b:
         st.subheader("Ventas por método de pago")
         if len(v):
-            st.bar_chart(v.groupby("Metodo_Pago")["Total"].sum())
+            met = v.groupby("Metodo_Pago", as_index=False)["Total"].sum()
+            st.altair_chart(graf_dona(met, "Metodo_Pago", "Total"), use_container_width=True)
         st.subheader("Top categorías")
         if len(v):
-            st.bar_chart(v.groupby("Categoria")["Total"].sum().sort_values(ascending=False).head(5))
+            cat = (v.groupby("Categoria", as_index=False)["Total"].sum()
+                   .sort_values("Total", ascending=False).head(5))
+            st.altair_chart(graf_barras(cat, "Categoria", "Total", horizontal=True, alto=220),
+                            use_container_width=True)
 
     st.subheader("🚨 Alertas de stock (Stock ≤ Mínimo)")
     if len(inv):
@@ -1246,7 +1347,7 @@ elif pg == "🧾 Ventas y Caja":
                 st.session_state.ultimo_ticket = {
                     "id": ticket, "fecha": ahora_str(), "items": items_ticket,
                     "total": total, "metodo": metodo, "caja": caja, "notas": notas,
-                    "vendedor": f"{st.session_state.auth['Nombre']} ({st.session_state.auth['Documento']})"}
+                    "vendedor": f"{st.session_state.auth['Nombre']}"}
                 st.session_state.auto_print_ticket = True
                 st.rerun()
             if ccc2.button("🧹 Vaciar ticket"):
@@ -1837,18 +1938,34 @@ else:
     k2.metric("Unidades", f"{int(f['Cantidad'].sum()):,}".replace(",", "."))
     k3.metric("Tickets", f"{f['ID_Venta'].nunique():,}".replace(",", "."))
     k4.metric("Ticket promedio", fmt_gs(f.groupby("ID_Venta")["Total"].sum().mean()))
+    st.subheader("Evolución en el período")
+    evo = f.groupby(f["Fecha"].dt.date)["Total"].sum().reset_index()
+    evo.columns = ["Fecha", "Total"]
+    evo["Fecha"] = pd.to_datetime(evo["Fecha"])
+    st.altair_chart(graf_serie(evo, "Fecha", "Total", alto=280), use_container_width=True)
     c1, c2 = st.columns(2)
     with c1:
         st.subheader("Por categoría")
-        st.bar_chart(f.groupby("Categoria")["Total"].sum().sort_values(ascending=False))
+        st.altair_chart(graf_barras(f.groupby("Categoria", as_index=False)["Total"].sum()
+                                    .sort_values("Total", ascending=False),
+                                    "Categoria", "Total", horizontal=True),
+                        use_container_width=True)
         st.subheader("Por método de pago")
-        st.bar_chart(f.groupby("Metodo_Pago")["Total"].sum())
+        st.altair_chart(graf_dona(f.groupby("Metodo_Pago", as_index=False)["Total"].sum(),
+                                  "Metodo_Pago", "Total"),
+                        use_container_width=True)
     with c2:
         st.subheader("Por caja")
-        st.bar_chart(f.groupby("Caja")["Total"].sum())
+        st.altair_chart(graf_barras(f.groupby("Caja", as_index=False)["Total"].sum(),
+                                    "Caja", "Total"),
+                        use_container_width=True)
         if "Vendedor_Nombre" in f.columns and f["Vendedor_Nombre"].fillna("").ne("").any():
             st.subheader("Por vendedor (auditoría)")
-            st.bar_chart(f[f["Vendedor_Nombre"].fillna("") != ""].groupby("Vendedor_Nombre")["Total"].sum())
+            st.altair_chart(graf_barras(f[f["Vendedor_Nombre"].fillna("") != ""]
+                                        .groupby("Vendedor_Nombre", as_index=False)["Total"].sum()
+                                        .sort_values("Total", ascending=False),
+                                        "Vendedor_Nombre", "Total", horizontal=True),
+                            use_container_width=True)
         st.subheader("Top 10 productos")
         top = f.groupby("Producto").agg(Unidades=("Cantidad", "sum"), Total=("Total", "sum")).sort_values(
             "Total", ascending=False).head(10)
