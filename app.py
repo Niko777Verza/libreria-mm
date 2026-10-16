@@ -915,7 +915,8 @@ CATEGORIAS = obtener_categorias(inv)
 # ------------------------------------------------------------------ Sidebar
 MENU_COMPLETO = ["📊 Panel Principal", "📦 Inventario", "🧾 Ventas y Caja", "💰 Arqueo de Caja",
                  "🤝 Deudores", "🔄 Importar / Exportar", "📈 Reportes", "👥 Usuarios"]
-MENU_CAJERO = ["📊 Panel Principal", "📦 Inventario", "🧾 Ventas y Caja", "💰 Arqueo de Caja"]
+MENU_CAJERO = ["📊 Panel Principal", "📦 Inventario", "🧾 Ventas y Caja", "💰 Arqueo de Caja",
+               "🤝 Deudores"]
 MENU = MENU_CAJERO if rol_actual() == "Cajero" else MENU_COMPLETO
 if st.session_state.pagina not in MENU:
     st.session_state.pagina = MENU[0]
@@ -1725,7 +1726,13 @@ elif pg == "💰 Arqueo de Caja":
 # ---------------------------------------------------------------- DEUDORES
 elif pg == "🤝 Deudores":
     st.header("🤝 Control de deudores (Gs.)")
-    t1, t2, t3 = st.tabs(["📋 Cuentas", "➕ Nuevo / Abono", "✏️ Editar deuda"])
+    _tabs_d = ["📋 Cuentas", "➕ Nuevo / Abono", "✏️ Editar deuda"] if es_gestor_usuarios() \
+        else ["📋 Cuentas", "➕ Nuevo / Abono"]
+    if len(_tabs_d) == 3:
+        t1, t2, t3 = st.tabs(_tabs_d)
+    else:
+        t1, t2 = st.tabs(_tabs_d)
+        t3 = None
     with t2:
         st.subheader("🧾 Nueva deuda por productos")
         c1, c2 = st.columns(2)
@@ -1829,24 +1836,27 @@ elif pg == "🤝 Deudores":
                         guardar_deudores(d)
                         st.success(f"✅ Sumado {nombre_e} x{int(cant_e)} ({fmt_gs(sub)}) a {_id}.")
                         st.rerun()
-                with st.expander("➖ Quitar producto / descontar monto"):
-                    monto_q = st.number_input("Monto a descontar (Gs.)", min_value=1000, step=1000,
-                                              format="%d", key="deud_q_monto")
-                    motivo_q = st.text_input("Motivo (ej. devolvió 2 cuadernos)", key="deud_q_mot")
-                    if st.button("➖ Aplicar descuento", key="deud_q_go"):
-                        d = deud.copy()
-                        i = d.index[d["ID"] == _id][0]
-                        pag = a_entero(d.loc[i, "Monto_Pagado"])
-                        nuevo_tot = max(pag, a_entero(d.loc[i, "Monto_Total"]) - a_entero(monto_q))
-                        d.loc[i, "Monto_Total"] = nuevo_tot
-                        d.loc[i, "Saldo"] = nuevo_tot - pag
-                        d.loc[i, "Concepto"] = str(d.loc[i, "Concepto"]) + (
-                            f" [Quita {fmt_gs(monto_q)}: {motivo_q.strip() or 'ajuste'}]")
-                        d.loc[i, "Estado"] = "Pagado" if d.loc[i, "Saldo"] <= 0 else (
-                            "Parcial" if pag > 0 else "Pendiente")
-                        guardar_deudores(d)
-                        st.success(f"✅ Descontado {fmt_gs(monto_q)} de {_id}.")
-                        st.rerun()
+                if es_gestor_usuarios():
+                    with st.expander("➖ Quitar producto / descontar monto"):
+                        monto_q = st.number_input("Monto a descontar (Gs.)", min_value=1000, step=1000,
+                                                  format="%d", key="deud_q_monto")
+                        motivo_q = st.text_input("Motivo (ej. devolvió 2 cuadernos)", key="deud_q_mot")
+                        if st.button("➖ Aplicar descuento", key="deud_q_go"):
+                            d = deud.copy()
+                            i = d.index[d["ID"] == _id][0]
+                            pag = a_entero(d.loc[i, "Monto_Pagado"])
+                            nuevo_tot = max(pag, a_entero(d.loc[i, "Monto_Total"]) - a_entero(monto_q))
+                            d.loc[i, "Monto_Total"] = nuevo_tot
+                            d.loc[i, "Saldo"] = nuevo_tot - pag
+                            d.loc[i, "Concepto"] = str(d.loc[i, "Concepto"]) + (
+                                f" [Quita {fmt_gs(monto_q)}: {motivo_q.strip() or 'ajuste'}]")
+                            d.loc[i, "Estado"] = "Pagado" if d.loc[i, "Saldo"] <= 0 else (
+                                "Parcial" if pag > 0 else "Pendiente")
+                            guardar_deudores(d)
+                            st.success(f"✅ Descontado {fmt_gs(monto_q)} de {_id}.")
+                            st.rerun()
+                else:
+                    st.caption("🔒 Los descuentos/ajustes requieren rol Admin o SuperUsuario.")
             else:
                 st.success("Sin saldos pendientes. 🎉")
         else:
@@ -1886,7 +1896,8 @@ elif pg == "🤝 Deudores":
                     st.rerun()
             else:
                 st.success("Sin saldos pendientes. 🎉")
-    with t3:
+    if t3 is not None:
+      with t3:
         st.subheader("✏️ Editar deuda ya creada")
         if not len(deud):
             st.info("No hay deudas para editar.")
@@ -1980,10 +1991,17 @@ elif pg == "🤝 Deudores":
                     _fw = deud[deud["ID"] == _wid].iloc[0]
                     _num = caja.wa_numero(_fw["Telefono"])
                     _msg = caja.mensaje_cobro(str(_fw["Cliente"]), fmt_gs(_fw["Saldo"]),
-                                              str(_fw["Fecha_Vencimiento"]), str(_fw["Concepto"]))
-                    st.text_area("Mensaje (vista previa)", _msg, height=120, key="wa_prev")
+                                              fmt_fecha(_fw["Fecha_Vencimiento"]),
+                                              str(_fw["Concepto"]))
+                    _wk, _bk = f"wa_msg_{_wid}", f"wa_base_{_wid}"
+                    if st.session_state.get(_bk) != _msg:
+                        st.session_state[_bk] = _msg
+                        st.session_state[_wk] = _msg
+                    st.text_area("Mensaje (editable: lo que escribas aquí es lo que se envía)",
+                                 key=_wk, height=120)
+                    _final = st.session_state.get(_wk, _msg) or _msg
                     if _num:
-                        st.link_button("📲 Abrir WhatsApp", caja.wa_link(_num, _msg))
+                        st.link_button("📲 Abrir WhatsApp", caja.wa_link(_num, _final))
                         st.caption(f"Se abrirá el chat con +{_num}.")
                     else:
                         st.warning("⚠️ Esta cuenta no tiene un teléfono paraguayo válido "
@@ -2009,16 +2027,17 @@ elif pg == "🤝 Deudores":
                     _sald = a_entero(_fd.iloc[0]["Saldo"]) if len(_fd) else 0
                     components.html(caja.recibo_abono_html(_fa.to_dict(), _sald, _totd),
                                     height=520, scrolling=True)
-            with st.expander("🗑️ Eliminar una deuda"):
-                del_id = st.selectbox("Deuda a eliminar", deud["ID"].tolist(), key="deud_del_id")
-                conf = st.checkbox(f"Confirmo eliminar {del_id} definitivamente", key="deud_del_conf")
-                if st.button("Eliminar definitivamente", key="deud_del_go"):
-                    if not conf:
-                        st.warning("Marca la confirmación primero.")
-                    else:
-                        guardar_deudores(deud[deud["ID"] != del_id].reset_index(drop=True))
-                        st.success(f"Deuda {del_id} eliminada.")
-                        st.rerun()
+            if es_gestor_usuarios():
+                with st.expander("🗑️ Eliminar una deuda"):
+                    del_id = st.selectbox("Deuda a eliminar", deud["ID"].tolist(), key="deud_del_id")
+                    conf = st.checkbox(f"Confirmo eliminar {del_id} definitivamente", key="deud_del_conf")
+                    if st.button("Eliminar definitivamente", key="deud_del_go"):
+                        if not conf:
+                            st.warning("Marca la confirmación primero.")
+                        else:
+                            guardar_deudores(deud[deud["ID"] != del_id].reset_index(drop=True))
+                            st.success(f"Deuda {del_id} eliminada.")
+                            st.rerun()
 
 # ------------------------------------------------------- IMPORTAR/EXPORTAR
 elif pg == "🔄 Importar / Exportar":
