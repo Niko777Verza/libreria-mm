@@ -88,6 +88,17 @@ st.markdown(
     unsafe_allow_html=True)
 
 
+def fmt_fecha(v, con_hora: bool = False) -> str:
+    """Fecha en formato local DD/MM/YYYY (opcionalmente HH:MM)."""
+    try:
+        ts = pd.to_datetime(v, errors="coerce")
+        if pd.isna(ts):
+            return ""
+        return ts.strftime("%d/%m/%Y %H:%M" if con_hora else "%d/%m/%Y")
+    except (TypeError, ValueError):
+        return ""
+
+
 def csv_puntoycoma_bytes(df: pd.DataFrame) -> bytes:
     """CSV con `;` como separador y BOM UTF-8 para que Excel lo abra en columnas."""
     return df.to_csv(index=False, sep=";").encode("utf-8-sig")
@@ -563,9 +574,9 @@ def graf_serie(datos: pd.DataFrame, x: str, valor: str, titulo: str = "", alto: 
 
     c = _colores_grafico()
     base = alt.Chart(datos).encode(
-        x=alt.X(f"{x}:T", title=None),
+        x=alt.X(f"{x}:T", title=None, axis=alt.Axis(format="%d/%m/%Y")),
         y=alt.Y(f"{valor}:Q", title="Total (Gs.)", axis=alt.Axis(format=",")),
-        tooltip=[alt.Tooltip(f"{x}:T", title="Fecha"),
+        tooltip=[alt.Tooltip(f"{x}:T", title="Fecha", format="%d/%m/%Y"),
                  alt.Tooltip(valor, format=",", title="Gs.")])
     area = base.mark_area(opacity=0.25, color=c["area"])
     linea = base.mark_line(color=c["acento"], strokeWidth=2.5)
@@ -650,6 +661,10 @@ def _formato_profesional(ws, df: pd.DataFrame) -> None:
                 cell.alignment = Alignment(horizontal="right", vertical="center")
             elif col in COLS_CANTIDAD:
                 cell.number_format = FMT_CANT_XL
+                cell.alignment = Alignment(horizontal="center", vertical="center")
+            elif isinstance(cell.value, datetime):
+                # Fechas en formato local DD/MM/YYYY aunque la columna sea mixta
+                cell.number_format = "DD/MM/YYYY HH:MM"
                 cell.alignment = Alignment(horizontal="center", vertical="center")
             elif row_idx > 1:
                 cell.alignment = Alignment(vertical="center", wrap_text=True)
@@ -1419,20 +1434,21 @@ elif pg == "🧾 Ventas y Caja":
         else:
             v["Fecha"] = pd.to_datetime(v["Fecha"], errors="coerce")
             c1, c2, c3 = st.columns(3)
-            d1 = c1.date_input("Desde", v["Fecha"].min().date())
-            d2 = c2.date_input("Hasta", v["Fecha"].max().date())
+            d1 = c1.date_input("Desde", v["Fecha"].min().date(), format="DD/MM/YYYY")
+            d2 = c2.date_input("Hasta", v["Fecha"].max().date(), format="DD/MM/YYYY")
             fm = c3.selectbox("Método", ["Todos"] + sorted(v["Metodo_Pago"].dropna().unique().tolist()))
             f = v[(v["Fecha"].dt.date >= d1) & (v["Fecha"].dt.date <= d2)]
             if fm != "Todos":
                 f = f[f["Metodo_Pago"] == fm]
-            ver = f.copy()
+            ver = f.sort_values("Fecha", ascending=False).copy()
+            ver["Fecha"] = ver["Fecha"].map(lambda x: fmt_fecha(x, con_hora=True))
             ver["Precio_Unitario"] = ver["Precio_Unitario"].map(fmt_gs)
             ver["Total"] = ver["Total"].map(fmt_gs)
             if "Vendedor_Nombre" in ver.columns:
                 ver["Vendedor"] = (ver["Vendedor_Nombre"].fillna("").astype(str) + " ("
                                    + ver["Vendedor_Doc"].fillna("").astype(str) + ")")
                 ver.loc[ver["Vendedor"] == " ()", "Vendedor"] = "—"
-            st.dataframe(ver.sort_values("Fecha", ascending=False), use_container_width=True)
+            st.dataframe(ver, use_container_width=True)
             m1, m2, m3 = st.columns(3)
             m1.metric("Total período", fmt_gs(f["Total"].sum()))
             m2.metric("Tickets", f"{f['ID_Venta'].nunique():,}".replace(",", "."))
@@ -1716,8 +1732,8 @@ elif pg == "🤝 Deudores":
         cli = c1.text_input("Cliente *", key="deud_cli")
         tel = c2.text_input("Teléfono", key="deud_tel")
         c3, c4 = st.columns(2)
-        fp = c3.date_input("Fecha préstamo", date.today(), key="deud_fp")
-        fv = c4.date_input("Vencimiento", date.today(), key="deud_fv")
+        fp = c3.date_input("Fecha préstamo", date.today(), key="deud_fp", format="DD/MM/YYYY")
+        fv = c4.date_input("Vencimiento", date.today(), key="deud_fv", format="DD/MM/YYYY")
 
         st.markdown("**Agregar productos a la deuda**")
         if len(inv):
@@ -1900,8 +1916,10 @@ elif pg == "🤝 Deudores":
             except (ValueError, TypeError):
                 fv_def = date.today()
             df1, df2 = st.columns(2)
-            ed_fp = df1.date_input("Fecha préstamo", value=fp_def, key=f"ed_fp_{_eid}")
-            ed_fv = df2.date_input("Vencimiento", value=fv_def, key=f"ed_fv_{_eid}")
+            ed_fp = df1.date_input("Fecha préstamo", value=fp_def, key=f"ed_fp_{_eid}",
+                                     format="DD/MM/YYYY")
+            ed_fv = df2.date_input("Vencimiento", value=fv_def, key=f"ed_fv_{_eid}",
+                                   format="DD/MM/YYYY")
             nuevo_saldo = a_entero(ed_tot) - a_entero(ed_pag)
             st.info(f"Saldo recalculado: {fmt_gs(max(nuevo_saldo, 0))} "
                     f"(Total {fmt_gs(ed_tot)} − Pagado {fmt_gs(ed_pag)})")
@@ -2236,8 +2254,8 @@ else:
     v["Fecha"] = pd.to_datetime(v["Fecha"], errors="coerce")
     v = v.dropna(subset=["Fecha"])
     c1, c2 = st.columns(2)
-    d1 = c1.date_input("Desde", v["Fecha"].min().date())
-    d2 = c2.date_input("Hasta", v["Fecha"].max().date())
+    d1 = c1.date_input("Desde", v["Fecha"].min().date(), format="DD/MM/YYYY")
+    d2 = c2.date_input("Hasta", v["Fecha"].max().date(), format="DD/MM/YYYY")
     f = v[(v["Fecha"].dt.date >= d1) & (v["Fecha"].dt.date <= d2)]
     if not len(f):
         st.warning("Sin ventas en ese rango.")
@@ -2282,6 +2300,27 @@ else:
         top_ver = top.copy()
         top_ver["Total"] = top_ver["Total"].map(fmt_gs)
         st.dataframe(top_ver, use_container_width=True)
+    st.divider()
+    st.subheader(f"📦 Desglose por categoría y artículos ({d1.strftime('%d/%m/%Y')} – {d2.strftime('%d/%m/%Y')})")
+    st.caption("Respeta el rango de fechas seleccionado. Expande cada categoría para ver "
+               "qué artículos se movieron, en qué cantidad y cuánto recaudó cada uno.")
+    _cats = (f.groupby("Categoria", as_index=False)["Total"].sum()
+             .sort_values("Total", ascending=False))
+    for _crow in _cats.itertuples():
+        _cat, _ctot = _crow.Categoria, int(_crow.Total)
+        _fc = f[f["Categoria"] == _cat]
+        _det = (_fc.groupby("Producto", as_index=False).agg(Unidades=("Cantidad", "sum"),
+                                                             Total=("Total", "sum"))
+                .sort_values("Total", ascending=False))
+        _uni = f"{int(_det['Unidades'].sum()):,}".replace(",", ".")
+        with st.expander(f"🏷️ {_cat} — {_uni} un. — {fmt_gs(_ctot)}", expanded=False):
+            if len(_det) > 1:
+                st.altair_chart(graf_barras(_det.head(10), "Producto", "Total",
+                                            horizontal=True, alto=max(120, 40 * min(len(_det), 10))),
+                                use_container_width=True)
+            _ver = _det.copy()
+            _ver["Total"] = _ver["Total"].map(fmt_gs)
+            st.dataframe(_ver, use_container_width=True)
     if len(inv):
         costos = dict(zip(inv["SKU"].astype(str), inv["Costo"]))
         ff = f.copy()
