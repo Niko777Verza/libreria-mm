@@ -6,3 +6,7 @@ __pycache__/
 data/*
 !data/.gitkeep
 *.log
+*.exe
+*.spec
+build/
+dist/
