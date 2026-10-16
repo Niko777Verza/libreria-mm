@@ -75,6 +75,8 @@ st.markdown(
     "[data-testid='stMetric'] label{font-weight:600;}"
     "[data-testid='stMetric'] [data-testid='stMetricValue']{font-variant-numeric:tabular-nums;}"
     "div[data-testid='stAlert']{border-radius:12px;}"
+    ".vega-embed svg text{fill:CanvasText !important;}"
+    ".vega-embed .mark-text{fill:CanvasText !important;}"
     ".stTabs [data-baseweb='tab']{border-radius:10px 10px 0 0;}"
     "button[kind='primary']{border-radius:10px;}"
     "@media (prefers-color-scheme:dark){"
@@ -442,17 +444,42 @@ def resaltar_stock(df: pd.DataFrame) -> pd.io.formats.style.Styler:
     )
 
 
-def _colores_grafico() -> dict:
-    """Paleta según el tema activo (claro/oscuro) para que los gráficos lean bien."""
-    oscuro = False
+def _tema_oscuro() -> bool:
+    """Detecta modo oscuro de forma robusta.
+
+    `theme.base` puede valer "system" (seguir al SO), caso en que no dice el
+    tema real: ahí se consulta `st.context.theme` (ya resuelto). Si nada es
+    concluyente se asume claro; el CSS de respaldo (CanvasText) cubre el resto.
+    """
     try:
-        oscuro = st.get_option("theme.base") == "dark"
+        ctx = getattr(st, "context", None)
+        theme = getattr(ctx, "theme", None) if ctx is not None else None
+        base = getattr(theme, "base", None)
+        if base == "dark":
+            return True
+        if base == "light":
+            return False
     except Exception:
         pass
+    try:
+        base = st.get_option("theme.base")
+        if base == "dark":
+            return True
+        if base == "light":
+            return False
+    except Exception:
+        pass
+    return False
+
+
+def _colores_grafico() -> dict:
+    """Paleta según el tema activo (claro/oscuro) para que los gráficos lean bien."""
+    oscuro = _tema_oscuro()
+    # Acento medio: visible sobre fondo blanco Y negro (evita gráfico "en blanco").
     return {"texto": "#e8eaed" if oscuro else "#1f2937",
-            "rejilla": "#3c4043" if oscuro else "#e5e7eb",
-            "acento": "#4da3ff" if oscuro else "#1F4E79",
-            "area": "#4da3ff" if oscuro else "#1F4E79"}
+            "rejilla": "#9aa0a6" if oscuro else "#e5e7eb",
+            "acento": "#2E86DE",
+            "area": "#2E86DE"}
 
 
 def _base_grafico(chart, titulo: str = ""):
@@ -489,12 +516,12 @@ def graf_dona(datos: pd.DataFrame, etiqueta: str, valor: str, titulo: str = "", 
     """Dona interactiva con tooltip y resaltado al pasar el cursor."""
     import altair as alt
 
-    c = _colores_grafico()
     sel = alt.selection_point(fields=[etiqueta], on="mouseover", clear="mouseout")
     chart = (alt.Chart(datos).mark_arc(innerRadius=70, outerRadius=120, cornerRadius=5)
              .encode(theta=alt.Theta(f"{valor}:Q"),
                      color=alt.Color(f"{etiqueta}:N",
-                                     scale=alt.Scale(scheme="blues" if c["texto"] == "#1f2937" else "lighttealblue"),
+                                     # Paleta categórica legible en claro Y oscuro
+                                     scale=alt.Scale(scheme="tableau10"),
                                      legend=alt.Legend(title=None)),
                      tooltip=[etiqueta, alt.Tooltip(valor, format=",", title="Gs.")],
                      opacity=alt.condition(sel, alt.value(1), alt.value(0.45)))
@@ -514,8 +541,7 @@ def graf_serie(datos: pd.DataFrame, x: str, valor: str, titulo: str = "", alto: 
                  alt.Tooltip(valor, format=",", title="Gs.")])
     area = base.mark_area(opacity=0.25, color=c["area"])
     linea = base.mark_line(color=c["acento"], strokeWidth=2.5)
-    puntos = base.mark_circle(size=70, color=c["acento"]).encode(
-        opacity=alt.condition(alt.selection_point(on="mouseover"), alt.value(1), alt.value(0.85)))
+    puntos = base.mark_circle(size=70, color=c["acento"], opacity=0.9)
     chart = (area + linea + puntos).interactive()
     return _base_grafico(chart.properties(height=alto), titulo)
 
@@ -915,7 +941,8 @@ if pg == "📊 Panel Principal":
             if len(ult):
                 diario = ult.groupby(ult["Fecha"].dt.date)["Total"].sum().reset_index()
                 diario.columns = ["Fecha", "Total"]
-                diario["Fecha"] = pd.to_datetime(diario["Fecha"])
+                diario["Fecha"] = pd.to_datetime(diario["Fecha"], errors="coerce")
+                diario = diario.dropna(subset=["Fecha"]).sort_values("Fecha")
                 st.altair_chart(graf_serie(diario, "Fecha", "Total"), use_container_width=True)
             else:
                 st.info("Sin ventas en los últimos 14 días.")
@@ -1941,7 +1968,8 @@ else:
     st.subheader("Evolución en el período")
     evo = f.groupby(f["Fecha"].dt.date)["Total"].sum().reset_index()
     evo.columns = ["Fecha", "Total"]
-    evo["Fecha"] = pd.to_datetime(evo["Fecha"])
+    evo["Fecha"] = pd.to_datetime(evo["Fecha"], errors="coerce")
+    evo = evo.dropna(subset=["Fecha"]).sort_values("Fecha")
     st.altair_chart(graf_serie(evo, "Fecha", "Total", alto=280), use_container_width=True)
     c1, c2 = st.columns(2)
     with c1:
