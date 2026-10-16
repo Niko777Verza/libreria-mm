@@ -110,6 +110,29 @@ def fmt_gs(x) -> str:
     return "Gs. " + f"{n:,}".replace(",", ".")
 
 
+def texto_limpio(v) -> str:
+    """Texto seguro desde Excel: NaN→"", floats enteros sin '.0' (tel 992209424.0→992209424)."""
+    try:
+        if pd.isna(v):
+            return ""
+    except (TypeError, ValueError):
+        pass
+    s = str(v).strip()
+    if s.lower() in ("nan", "none", "nat", ""):
+        return ""
+    if re.fullmatch(r"-?\d+\.0+", s):
+        s = s.split(".")[0]
+    return s
+
+
+def normalizar_texto_df(df: pd.DataFrame, cols: tuple[str, ...]) -> pd.DataFrame:
+    """Fuerza columnas de texto a str limpio (evita TypeError/LossySetitemError)."""
+    for c in cols:
+        if c in df.columns:
+            df[c] = df[c].map(texto_limpio)
+    return df
+
+
 def ahora_str() -> str:
     return datetime.now().strftime("%Y-%m-%d %H:%M")
 
@@ -274,7 +297,7 @@ def _guardar_excel(df: pd.DataFrame, path: Path, hoja: str) -> None:
 def cargar_inventario() -> pd.DataFrame:
     df = _leer_excel_seguro(INV_PATH, "Inventario", df_vacio_inv())
     if len(df):
-        df["SKU"] = df["SKU"].astype(str).str.strip()
+        normalizar_texto_df(df, ("SKU", "Nombre", "Categoria", "Fecha_Actualizacion"))
         # CORRECCIÓN 1: todo monetario y stock como enteros (sin .00)
         for c in ("Costo", "Precio_Sugerido", "Precio_Actual"):
             df[c] = pd.to_numeric(df[c], errors="coerce").fillna(0).round(0).astype(int)
@@ -289,6 +312,8 @@ def cargar_inventario() -> pd.DataFrame:
 def cargar_ventas() -> pd.DataFrame:
     df = _leer_excel_seguro(VENTAS_PATH, "Ventas", df_vacio_ventas())
     if len(df):
+        normalizar_texto_df(df, ("ID_Venta", "SKU", "Producto", "Categoria", "Metodo_Pago",
+                                 "Caja", "Notas", "Vendedor_Doc", "Vendedor_Nombre"))
         df["Fecha"] = pd.to_datetime(df["Fecha"], errors="coerce")
         df["Cantidad"] = pd.to_numeric(df["Cantidad"], errors="coerce").fillna(0).round(0).astype(int)
         for c in ("Precio_Unitario", "Total"):
@@ -300,6 +325,8 @@ def cargar_ventas() -> pd.DataFrame:
 def cargar_deudores() -> pd.DataFrame:
     df = _leer_excel_seguro(DEUD_PATH, "Deudores", df_vacio_deud())
     if len(df):
+        normalizar_texto_df(df, ("ID", "Cliente", "Telefono", "Concepto",
+                                 "Fecha_Prestamo", "Fecha_Vencimiento", "Estado"))
         for c in ("Monto_Total", "Monto_Pagado", "Saldo"):
             df[c] = pd.to_numeric(df[c], errors="coerce").fillna(0).round(0).astype(int)
     return df
@@ -352,7 +379,7 @@ def df_vacio_usu() -> pd.DataFrame:
 def cargar_usuarios() -> pd.DataFrame:
     df = _leer_excel_seguro(USU_PATH, "Usuarios", df_vacio_usu())
     if len(df):
-        df["Documento"] = df["Documento"].astype(str).str.strip()
+        normalizar_texto_df(df, ("Documento", "Nombre", "Rol", "Fecha_Creacion"))
         df["Activo"] = df["Activo"].astype(str).str.lower().isin(["true", "1", "sí", "si", "activo"])
     return df
 
@@ -1633,6 +1660,51 @@ elif pg == "💰 Arqueo de Caja":
                            df_a_excel_bytes({"Turnos": turnos_h[caja.COL_TURNO],
                                              "Movimientos": caja.cargar_movimientos()[caja.COL_MOV]}),
                            file_name=f"arqueos-MM-{date.today()}.xlsx", key="dl_turnos")
+        if es_gestor_usuarios():
+            with st.expander("🛠️ Administrar turnos (editar / eliminar)"):
+                st.caption("Solo Admin/SuperUsuario. No se puede eliminar un turno **Abierto** "
+                           "(ciérralo primero con Corte Z). Los movimientos del turno eliminado "
+                           "también se quitan para mantener la integridad.")
+                _sel_t = st.selectbox("Turno", turnos_h.apply(
+                    lambda r: f"{r['ID_Turno']} — {r['Caja']} ({r['Estado']})", axis=1).tolist(),
+                    key="adm_turno_sel")
+                _tid = _sel_t.split(" — ")[0]
+                _ft = turnos_h[turnos_h["ID_Turno"] == _tid].iloc[0]
+                _abierto = str(_ft["Estado"]) == "Abierto"
+                ae1, ae2 = st.columns(2)
+                _e_fondo = ae1.number_input("Fondo inicial (Gs.)", min_value=0, step=1000,
+                                            value=a_entero(_ft["Fondo_Inicial"]), format="%d",
+                                            key=f"adm_tf_{_tid}")
+                _e_notas = ae2.text_input("Notas de cierre", value=str(_ft["Notas_Cierre"]),
+                                          key=f"adm_tn_{_tid}")
+                ac1, ac2 = st.columns(2)
+                if ac1.button("💾 Guardar edición", type="primary", key=f"adm_ts_{_tid}"):
+                    _tt = caja.cargar_turnos()
+                    _ix = _tt.index[_tt["ID_Turno"] == _tid][0]
+                    _tt.loc[_ix, "Fondo_Inicial"] = a_entero(_e_fondo)
+                    _tt.loc[_ix, "Notas_Cierre"] = _e_notas.strip()
+                    caja.guardar_turnos(_tt)
+                    st.success(f"✅ Turno {_tid} actualizado.")
+                    st.rerun()
+                with ac2.expander("🗑️ Eliminar turno"):
+                    if _abierto:
+                        st.info("Cierra el turno primero (Corte Z) antes de eliminarlo.")
+                    else:
+                        _conf = st.checkbox(f"Confirmo eliminar {_tid} y sus movimientos",
+                                            key=f"adm_td_{_tid}")
+                        if st.button("Eliminar definitivamente", key=f"adm_td_go_{_tid}"):
+                            if not _conf:
+                                st.warning("Marca la confirmación primero.")
+                            else:
+                                caja.guardar_turnos(
+                                    turnos_h[turnos_h["ID_Turno"] != _tid].reset_index(drop=True))
+                                _mm = caja.cargar_movimientos()
+                                caja.guardar_movimientos(
+                                    _mm[_mm["ID_Turno"] != _tid].reset_index(drop=True))
+                                st.success(f"Turno {_tid} y sus movimientos eliminados.")
+                                st.rerun()
+        else:
+            st.caption("🔒 La edición y el borrado de turnos requieren rol Admin o SuperUsuario.")
 
 # ---------------------------------------------------------------- DEUDORES
 elif pg == "🤝 Deudores":

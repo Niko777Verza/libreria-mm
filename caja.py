@@ -48,6 +48,28 @@ def _a_entero(x) -> int:
         return 0
 
 
+def texto_limpio(v) -> str:
+    """Texto seguro desde Excel: NaN→"", floats enteros sin '.0'."""
+    try:
+        if pd.isna(v):
+            return ""
+    except (TypeError, ValueError):
+        pass
+    s = str(v).strip()
+    if s.lower() in ("nan", "none", "nat", ""):
+        return ""
+    if re.fullmatch(r"-?\d+\.0+", s):
+        s = s.split(".")[0]
+    return s
+
+
+def normalizar_texto_df(df: pd.DataFrame, cols: tuple[str, ...]) -> pd.DataFrame:
+    for c in cols:
+        if c in df.columns:
+            df[c] = df[c].map(texto_limpio)
+    return df
+
+
 def _leer(path: Path, hoja: str, columnas: list) -> pd.DataFrame:
     if not path.exists():
         return pd.DataFrame(columns=columnas)
@@ -83,6 +105,8 @@ def asegurar_archivos() -> None:
 @st.cache_data(ttl=60)
 def cargar_turnos() -> pd.DataFrame:
     df = _leer(TURNOS_PATH, "Turnos", COL_TURNO)
+    normalizar_texto_df(df, ("ID_Turno", "Fecha_Apertura", "Fecha_Cierre", "Cajero_Doc",
+                             "Cajero_Nombre", "Caja", "Estado", "Notas_Cierre"))
     for c in ("Fondo_Inicial", "Ventas_Efectivo", "Ventas_Tarjeta", "Ventas_Transferencia",
               "Ventas_Otro", "Entradas", "Retiros", "Esperado_Efectivo",
               "Contado_Efectivo", "Diferencia"):
@@ -94,6 +118,8 @@ def cargar_turnos() -> pd.DataFrame:
 @st.cache_data(ttl=60)
 def cargar_movimientos() -> pd.DataFrame:
     df = _leer(MOVS_PATH, "Movimientos", COL_MOV)
+    normalizar_texto_df(df, ("ID_Mov", "ID_Turno", "Fecha", "Tipo", "Concepto",
+                             "Cajero_Doc", "Cajero_Nombre"))
     if len(df) and "Monto" in df.columns:
         df["Monto"] = pd.to_numeric(df["Monto"], errors="coerce").fillna(0).round(0).astype(int)
     return df
@@ -102,6 +128,8 @@ def cargar_movimientos() -> pd.DataFrame:
 @st.cache_data(ttl=60)
 def cargar_abonos() -> pd.DataFrame:
     df = _leer(ABONOS_PATH, "Abonos", COL_ABONO)
+    normalizar_texto_df(df, ("ID_Abono", "ID_Deuda", "Cliente", "Fecha", "Metodo",
+                             "Cajero_Doc", "Cajero_Nombre", "Notas"))
     if len(df) and "Monto" in df.columns:
         df["Monto"] = pd.to_numeric(df["Monto"], errors="coerce").fillna(0).round(0).astype(int)
     return df
