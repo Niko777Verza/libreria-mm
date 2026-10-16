@@ -494,6 +494,19 @@ def sincronizar_inicio() -> str:
         return "local"
 
 
+def _error_amable(nombre: str, e: Exception) -> str:
+    """Resume errores técnicos de Drive en instrucciones accionables."""
+    txt = str(e)
+    if "storageQuotaExceeded" in txt or "Service Accounts do not have storage quota" in txt:
+        return (f"'{nombre}' aún no existe en Drive y la cuenta de servicio no puede crearlo: "
+                f"súbelo manualmente una sola vez a la carpeta compartida y luego se actualiza solo")
+    if "HttpError 404" in txt:
+        return f"'{nombre}' no se encontró en Drive (¿se movió o eliminó?)"
+    if "HttpError 403" in txt:
+        return f"sin permiso sobre '{nombre}' (revisa que la carpeta esté compartida como Editor)"
+    return txt[:300]
+
+
 def sincronizacion_manual() -> tuple[bool, str]:
     """Sincronización manual del botón "🔄 Sincronizar con Drive". Nunca lanza.
 
@@ -519,7 +532,7 @@ def sincronizacion_manual() -> tuple[bool, str]:
             try:
                 r = _sincronizar_uno(service, cfg["folder"], nombre)
             except Exception as e:  # noqa: BLE001 — un archivo no frena los demás
-                errores.append(f"{nombre} ({e})")
+                errores.append(f"{nombre} ({_error_amable(nombre, e)})")
                 continue
             {"subido": subidos, "descargado": bajados, "igual": iguales,
              "conflicto": conflictos, "omitido": []}[r].append(nombre)
