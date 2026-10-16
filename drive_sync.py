@@ -40,7 +40,8 @@ DATA_DIR = BASE / "data"
 IDS_PATH = DATA_DIR / ".drive_ids.json"  # caché fileId + estado de sync (ignorado por git vía data/*)
 
 ARCHIVOS_SYNC = ["inventario.xlsx", "ventas.xlsx", "deudores.xlsx",
-                 "usuarios.xlsx", "categorias.txt", "categorias_ocultas.txt"]
+                 "usuarios.xlsx", "categorias.txt", "categorias_ocultas.txt",
+                 "caja_turnos.xlsx", "caja_movimientos.xlsx", "abonos.xlsx"]
 # Subconjunto crítico que se respalda solo tras cada cobro (rápido y selectivo).
 ARCHIVOS_VENTA = ["ventas.xlsx", "inventario.xlsx"]
 ESTADO_RESPALDO_PATH = DATA_DIR / ".respaldo_estado.json"  # {ok, ts, detalle}

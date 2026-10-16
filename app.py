@@ -22,6 +22,7 @@ from openpyxl.styles import Alignment, Border, Font, PatternFill, Side
 from openpyxl.utils import get_column_letter
 
 import drive_sync  # almacenamiento persistente (Drive en nube, local en PC)
+import caja  # arqueo de caja, abonos con recibo y WhatsApp
 
 # ---------------------------------------------------------------- Config
 APP_TITULO = "📚 Librería MM — Gestión"
@@ -870,9 +871,9 @@ if not st.session_state.auth:
 CATEGORIAS = obtener_categorias(inv)
 
 # ------------------------------------------------------------------ Sidebar
-MENU_COMPLETO = ["📊 Panel Principal", "📦 Inventario", "🧾 Ventas y Caja",
+MENU_COMPLETO = ["📊 Panel Principal", "📦 Inventario", "🧾 Ventas y Caja", "💰 Arqueo de Caja",
                  "🤝 Deudores", "🔄 Importar / Exportar", "📈 Reportes", "👥 Usuarios"]
-MENU_CAJERO = ["📊 Panel Principal", "📦 Inventario", "🧾 Ventas y Caja"]
+MENU_CAJERO = ["📊 Panel Principal", "📦 Inventario", "🧾 Ventas y Caja", "💰 Arqueo de Caja"]
 MENU = MENU_CAJERO if rol_actual() == "Cajero" else MENU_COMPLETO
 if st.session_state.pagina not in MENU:
     st.session_state.pagina = MENU[0]
@@ -1475,6 +1476,164 @@ elif pg == "🧾 Ventas y Caja":
                                    f"Stock devuelto: {devueltos} unidad(es). Drive sincronizado.")
                         st.rerun()
 
+# ------------------------------------------------------- ARQUEO DE CAJA
+elif pg == "💰 Arqueo de Caja":
+    st.header("💰 Arqueo y Control de Caja (Gs.)")
+    caja.asegurar_archivos()
+    turnos = caja.cargar_turnos()
+    movs = caja.cargar_movimientos()
+    auth = st.session_state.auth
+
+    tc1, tc2 = st.columns([1, 2])
+    caja_op = tc1.selectbox("Caja a operar", CAJAS, key="arq_caja_sel")
+    t_ab = caja.turno_abierto(turnos, caja_op)
+
+    if t_ab is None:
+        st.info(f"No hay turno abierto en **{caja_op}**. Abre uno para empezar a vender con control.")
+        with st.form("abrir_turno", clear_on_submit=True):
+            f1, f2 = st.columns(2)
+            fondo = f1.number_input("Fondo de cambio inicial (Gs.)", min_value=0, step=5000,
+                                    value=150000, format="%d")
+            if f2.form_submit_button("🟢 Abrir turno", type="primary"):
+                _tid = f"T-{datetime.now().strftime('%Y%m%d-%H%M%S')}"
+                _nt = pd.DataFrame([[_tid, ahora_str(), "", auth["Documento"], auth["Nombre"],
+                                      caja_op, a_entero(fondo), "Abierto",
+                                      0, 0, 0, 0, 0, 0, 0, 0, 0, ""]], columns=caja.COL_TURNO)
+                caja.guardar_turnos(pd.concat([turnos, _nt], ignore_index=True))
+                st.success(f"✅ Turno {_tid} abierto en {caja_op} con fondo {fmt_gs(fondo)}.")
+                st.rerun()
+    else:
+        st.success(f"Turno abierto **{t_ab['ID_Turno']}** · {caja_op} · "
+                   f"Cajero: {t_ab['Cajero_Nombre']} · Desde: {t_ab['Fecha_Apertura']}")
+        res = caja.resumen_turno(ventas, t_ab)
+        movs_t = caja.movimientos_turno(movs, str(t_ab["ID_Turno"]))
+        ent, ret = caja.totales_movimientos(movs_t)
+        m1, m2, m3, m4 = st.columns(4)
+        m1.metric("💵 Efectivo (ventas)", fmt_gs(res["Efectivo"]))
+        m2.metric("💳 Tarjeta/Transf./Otro",
+                  fmt_gs(res["Tarjeta"] + res["Transferencia"] + res["Otro"]))
+        m3.metric("📥 Entradas / 📤 Retiros", f"{fmt_gs(ent)} / {fmt_gs(ret)}")
+        m4.metric("🧮 Esperado en efectivo",
+                  fmt_gs(a_entero(t_ab["Fondo_Inicial"]) + res["Efectivo"] + ent - ret))
+
+        ct1, ct2 = st.columns(2)
+        with ct1:
+            with st.form("mov_caja", clear_on_submit=True):
+                st.markdown("**➕ Movimiento de caja chica**")
+                tm = st.selectbox("Tipo", ["Entrada", "Retiro"])
+                cm = st.text_input("Concepto *", placeholder="Ej. pago a fletero, insumos de limpieza")
+                mm = st.number_input("Monto (Gs.)", min_value=1000, step=1000, format="%d")
+                if st.form_submit_button("💾 Registrar movimiento", type="primary"):
+                    if not cm.strip():
+                        st.error("El concepto es obligatorio.")
+                    else:
+                        _mid = f"M-{datetime.now().strftime('%Y%m%d%H%M%S')}"
+                        _nm = pd.DataFrame([[_mid, str(t_ab["ID_Turno"]), ahora_str(), tm,
+                                              cm.strip(), a_entero(mm),
+                                              auth["Documento"], auth["Nombre"]]],
+                                           columns=caja.COL_MOV)
+                        caja.guardar_movimientos(pd.concat([movs, _nm], ignore_index=True))
+                        st.success(f"✅ {tm} de {fmt_gs(mm)} registrada.")
+                        st.rerun()
+        with ct2:
+            st.markdown("**📋 Movimientos del turno**")
+            if len(movs_t):
+                _vm = movs_t[["Fecha", "Tipo", "Concepto", "Monto"]].copy()
+                _vm["Monto"] = _vm["Monto"].map(fmt_gs)
+                st.dataframe(_vm.sort_values("Fecha", ascending=False), use_container_width=True)
+            else:
+                st.info("Sin movimientos extra en este turno.")
+
+        st.divider()
+        cx, cz = st.columns(2)
+        with cx:
+            with st.expander("📊 Corte X (informativo, no cierra el turno)"):
+                _dx = pd.DataFrame([{"Método": m, "Ventas": res[m]} for m in caja.METODOS_ARQUEO])
+                _dx["Ventas"] = _dx["Ventas"].map(fmt_gs)
+                st.dataframe(_dx, use_container_width=True)
+                st.metric("Tickets del turno", res["Tickets"])
+                st.metric("Total vendido", fmt_gs(res["Total"]))
+        with cz:
+            with st.expander("🔒 Corte Z — Arqueo ciego y cierre", expanded=False):
+                st.caption("Cuenta el dinero en mano SIN ver lo esperado. Al confirmar se revela la diferencia.")
+                z1, z2 = st.columns(2)
+                c_ef = z1.number_input("Contado en EFECTIVO (Gs.)", min_value=0, step=1000,
+                                       format="%d", key="z_ef")
+                c_tj = z2.number_input("Confirmado TARJETA (Gs.)", min_value=0, step=1000,
+                                       format="%d", key="z_tj")
+                c_tr = z1.number_input("Confirmado TRANSFERENCIA (Gs.)", min_value=0, step=1000,
+                                       format="%d", key="z_tr")
+                c_ot = z2.number_input("Confirmado OTRO (Gs.)", min_value=0, step=1000,
+                                       format="%d", key="z_ot")
+                _arq = caja.calcular_arqueo(t_ab, res, ent, ret,
+                                            {"Efectivo": a_entero(c_ef), "Tarjeta": a_entero(c_tj),
+                                             "Transferencia": a_entero(c_tr), "Otro": a_entero(c_ot)})
+                _vd = pd.DataFrame([{"Método": m, "Esperado": v["esperado"],
+                                     "Contado": v["contado"], "Diferencia": v["diferencia"]}
+                                    for m, v in _arq["por_metodo"].items()])
+                for _c in ("Esperado", "Contado", "Diferencia"):
+                    _vd[_c] = _vd[_c].map(fmt_gs)
+                st.dataframe(_vd, use_container_width=True)
+                _dif = _arq["diferencia"]
+                if _dif == 0:
+                    st.success("✅ SIN DIFERENCIA")
+                elif _dif > 0:
+                    st.success(f"SOBRANTE de {fmt_gs(_dif)}")
+                else:
+                    st.error(f"FALTANTE de {fmt_gs(-_dif)}")
+                _notas = st.text_input("Notas del cierre (opcional)", key="z_notas")
+                _conf = st.checkbox(f"Confirmo cerrar el turno {t_ab['ID_Turno']}", key="z_conf")
+                if st.button("🔒 Cerrar turno (Corte Z)", type="primary", key="z_go"):
+                    if not _conf:
+                        st.warning("Marca la confirmación primero.")
+                    else:
+                        _tt = caja.cargar_turnos()
+                        _ix = _tt.index[_tt["ID_Turno"] == str(t_ab["ID_Turno"])][0]
+                        _res2 = caja.resumen_turno(cargar_ventas(), _tt.loc[_ix])
+                        _arq2 = caja.calcular_arqueo(
+                            _tt.loc[_ix], _res2, ent, ret,
+                            {"Efectivo": a_entero(c_ef), "Tarjeta": a_entero(c_tj),
+                             "Transferencia": a_entero(c_tr), "Otro": a_entero(c_ot)})
+                        for _k, _col in (("Efectivo", "Ventas_Efectivo"), ("Tarjeta", "Ventas_Tarjeta"),
+                                         ("Transferencia", "Ventas_Transferencia"), ("Otro", "Ventas_Otro")):
+                            _tt.loc[_ix, _col] = int(_res2[_k])
+                        _tt.loc[_ix, "Fecha_Cierre"] = ahora_str()
+                        _tt.loc[_ix, "Estado"] = "Cerrado"
+                        _tt.loc[_ix, "Entradas"] = ent
+                        _tt.loc[_ix, "Retiros"] = ret
+                        _tt.loc[_ix, "Esperado_Efectivo"] = _arq2["esperado_efectivo"]
+                        _tt.loc[_ix, "Contado_Efectivo"] = _arq2["contado_efectivo"]
+                        _tt.loc[_ix, "Diferencia"] = _arq2["diferencia"]
+                        _tt.loc[_ix, "Notas_Cierre"] = _notas.strip()
+                        caja.guardar_turnos(_tt)
+                        st.session_state["_cierre_doc"] = caja.comprobante_cierre_html(
+                            _tt.loc[_ix], _res2, ent, ret, _arq2, auto_print=False)
+                        st.success(f"✅ Turno cerrado. Diferencia: {fmt_gs(_arq2['diferencia'])}.")
+                        st.rerun()
+        if st.session_state.get("_cierre_doc"):
+            st.divider()
+            st.subheader("🧾 Comprobante del último cierre")
+            components.html(st.session_state["_cierre_doc"], height=640, scrolling=True)
+            if st.button("✖️ Cerrar comprobante", key="cierre_close"):
+                st.session_state["_cierre_doc"] = None
+                st.rerun()
+
+    st.divider()
+    st.subheader("📜 Historial de turnos")
+    turnos_h = caja.cargar_turnos()
+    if not len(turnos_h):
+        st.info("Aún no hay turnos registrados.")
+    else:
+        _vh = turnos_h[["ID_Turno", "Caja", "Cajero_Nombre", "Fecha_Apertura", "Fecha_Cierre",
+                        "Estado", "Fondo_Inicial", "Diferencia"]].copy()
+        for _c in ("Fondo_Inicial", "Diferencia"):
+            _vh[_c] = _vh[_c].map(fmt_gs)
+        st.dataframe(_vh.sort_values("Fecha_Apertura", ascending=False), use_container_width=True)
+        st.download_button("⬇️ Descargar turnos (.xlsx)",
+                           df_a_excel_bytes({"Turnos": turnos_h[caja.COL_TURNO],
+                                             "Movimientos": caja.cargar_movimientos()[caja.COL_MOV]}),
+                           file_name=f"arqueos-MM-{date.today()}.xlsx", key="dl_turnos")
+
 # ---------------------------------------------------------------- DEUDORES
 elif pg == "🤝 Deudores":
     st.header("🤝 Control de deudores (Gs.)")
@@ -1613,7 +1772,9 @@ elif pg == "🤝 Deudores":
                 sel = st.selectbox("Cuenta", pendientes.apply(
                     lambda r: f"{r['ID']} — {r['Cliente']} (saldo {fmt_gs(r['Saldo'])})", axis=1).tolist())
                 _id = sel.split(" — ")[0]
-                monto = st.number_input("Monto del abono (Gs.)", min_value=1000, step=1000, format="%d")
+                ma1, ma2 = st.columns(2)
+                monto = ma1.number_input("Monto del abono (Gs.)", min_value=1000, step=1000, format="%d")
+                met_ab = ma2.selectbox("Método", METODOS_PAGO, key="abono_metodo")
                 if st.button("Registrar abono"):
                     d = deud.copy()
                     i = d.index[d["ID"] == _id][0]
@@ -1625,7 +1786,15 @@ elif pg == "🤝 Deudores":
                     else:
                         d.loc[i, "Estado"] = "Parcial"
                     guardar_deudores(d)
-                    st.success(f"✅ Abono de {fmt_gs(monto)} registrado en {_id}.")
+                    _ab = caja.cargar_abonos()
+                    _nid_ab = f"A-{datetime.now().strftime('%Y%m%d%H%M%S')}-{len(_ab) + 1:03d}"
+                    _fila_ab = pd.DataFrame([[_nid_ab, _id, str(d.loc[i, "Cliente"]), ahora_str(),
+                                               a_entero(monto), met_ab,
+                                               st.session_state.auth["Documento"],
+                                               st.session_state.auth["Nombre"], ""]],
+                                            columns=caja.COL_ABONO)
+                    caja.guardar_abonos(pd.concat([_ab, _fila_ab], ignore_index=True))
+                    st.success(f"✅ Abono de {fmt_gs(monto)} registrado en {_id} (recibo {_nid_ab}).")
                     st.rerun()
             else:
                 st.success("Sin saldos pendientes. 🎉")
@@ -1709,6 +1878,47 @@ elif pg == "🤝 Deudores":
             st.download_button("⬇️ Descargar deudores (.xlsx)",
                                df_a_excel_bytes({"Deudores": d[COL_DEUD]}),
                                file_name=f"deudores-MM-{date.today()}.xlsx")
+            with st.expander("📲 Notificar por WhatsApp"):
+                _pend = deud[deud["Saldo"] > 0]
+                if not len(_pend):
+                    st.info("Sin saldos pendientes para notificar.")
+                else:
+                    _selw = st.selectbox("Cuenta a notificar", _pend.apply(
+                        lambda r: f"{r['ID']} — {r['Cliente']} (saldo {fmt_gs(r['Saldo'])})",
+                        axis=1).tolist(), key="wa_sel")
+                    _wid = _selw.split(" — ")[0]
+                    _fw = deud[deud["ID"] == _wid].iloc[0]
+                    _num = caja.wa_numero(_fw["Telefono"])
+                    _msg = caja.mensaje_cobro(str(_fw["Cliente"]), fmt_gs(_fw["Saldo"]),
+                                              str(_fw["Fecha_Vencimiento"]), str(_fw["Concepto"]))
+                    st.text_area("Mensaje (vista previa)", _msg, height=120, key="wa_prev")
+                    if _num:
+                        st.link_button("📲 Abrir WhatsApp", caja.wa_link(_num, _msg))
+                        st.caption(f"Se abrirá el chat con +{_num}.")
+                    else:
+                        st.warning("⚠️ Esta cuenta no tiene un teléfono paraguayo válido "
+                                   "(ej. 0981 123456). Edítalo en ✏️ Editar deuda.")
+            with st.expander("📜 Historial de abonos y recibos"):
+                _ab = caja.cargar_abonos()
+                _selh = st.selectbox("Deuda", ["Todas"] + deud["ID"].tolist(), key="ab_hist_sel")
+                _vh = _ab if _selh == "Todas" else _ab[_ab["ID_Deuda"] == _selh]
+                if not len(_vh):
+                    st.info("Aún no hay abonos registrados (el historial corre desde esta versión).")
+                else:
+                    _verh = _vh.copy()
+                    _verh["Monto"] = _verh["Monto"].map(fmt_gs)
+                    st.dataframe(_verh.sort_values("Fecha", ascending=False),
+                                 use_container_width=True)
+                    _sela = st.selectbox("Recibo", _vh.apply(
+                        lambda r: f"{r['ID_Abono']} — {r['ID_Deuda']} ({fmt_gs(r['Monto'])})",
+                        axis=1).tolist(), key="ab_rec_sel")
+                    _aid = _sela.split(" — ")[0]
+                    _fa = _vh[_vh["ID_Abono"] == _aid].iloc[0]
+                    _fd = deud[deud["ID"] == _fa["ID_Deuda"]]
+                    _totd = a_entero(_fd.iloc[0]["Monto_Total"]) if len(_fd) else a_entero(_fa["Monto"])
+                    _sald = a_entero(_fd.iloc[0]["Saldo"]) if len(_fd) else 0
+                    components.html(caja.recibo_abono_html(_fa.to_dict(), _sald, _totd),
+                                    height=520, scrolling=True)
             with st.expander("🗑️ Eliminar una deuda"):
                 del_id = st.selectbox("Deuda a eliminar", deud["ID"].tolist(), key="deud_del_id")
                 conf = st.checkbox(f"Confirmo eliminar {del_id} definitivamente", key="deud_del_conf")

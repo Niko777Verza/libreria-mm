@@ -28,6 +28,14 @@ COLUMNAS_VENTAS = ["ID_Venta", "Fecha", "SKU", "Producto", "Categoria", "Cantida
 COLUMNAS_DEUD = ["ID", "Cliente", "Telefono", "Concepto", "Monto_Total",
                  "Monto_Pagado", "Saldo", "Fecha_Prestamo", "Fecha_Vencimiento", "Estado"]
 COLUMNAS_USU = ["Documento", "Nombre", "Password_Hash", "Rol", "Activo", "Fecha_Creacion"]
+COLUMNAS_TURNO = ["ID_Turno", "Fecha_Apertura", "Fecha_Cierre", "Cajero_Doc", "Cajero_Nombre",
+                  "Caja", "Fondo_Inicial", "Estado", "Ventas_Efectivo", "Ventas_Tarjeta",
+                  "Ventas_Transferencia", "Ventas_Otro", "Entradas", "Retiros",
+                  "Esperado_Efectivo", "Contado_Efectivo", "Diferencia", "Notas_Cierre"]
+COLUMNAS_MOV = ["ID_Mov", "ID_Turno", "Fecha", "Tipo", "Concepto", "Monto",
+                "Cajero_Doc", "Cajero_Nombre"]
+COLUMNAS_ABONO = ["ID_Abono", "ID_Deuda", "Cliente", "Fecha", "Monto",
+                  "Metodo", "Cajero_Doc", "Cajero_Nombre", "Notas"]
 
 
 def inventario_ejemplo() -> pd.DataFrame:
@@ -134,6 +142,14 @@ def main() -> None:
             continue
         guardar(df, nombre, hoja)
         print(f"✅ {dest} ({len(df)} filas, hoja '{hoja}')")
+    # Archivos de caja/abonos: solo se crean vacíos si no existen (nunca se pisan)
+    for df_v, nombre, hoja in [(pd.DataFrame(columns=COLUMNAS_TURNO), "caja_turnos.xlsx", "Turnos"),
+                               (pd.DataFrame(columns=COLUMNAS_MOV), "caja_movimientos.xlsx", "Movimientos"),
+                               (pd.DataFrame(columns=COLUMNAS_ABONO), "abonos.xlsx", "Abonos")]:
+        dest = DATA_DIR / nombre
+        if not dest.exists():
+            guardar(df_v, nombre, hoja)
+            print(f"✅ {dest} (vacío, hoja '{hoja}')")
     # Categorías iniciales persistidas
     cat_path = DATA_DIR / "categorias.txt"
     if not cat_path.exists() or force:
