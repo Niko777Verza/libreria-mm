@@ -29,7 +29,7 @@ import hashlib
 import json
 import os
 import shutil
-import threading
+import time
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -557,3 +557,7 @@ def sincronizacion_manual() -> tuple[bool, str]:
         return True, " ".join(partes)
     except Exception as e:  # noqa: BLE001
         return False, f"No se pudo sincronizar con Drive: {e}"
+
+
+# Fin del módulo drive_sync. La sincronización se gestiona desde app.py
+# mediante st.session_state (last_sync_time / is_syncing) sin hilos.

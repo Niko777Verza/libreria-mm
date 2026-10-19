@@ -864,16 +864,38 @@ if "pagina" not in st.session_state:
 if st.session_state.pagina == "📊 Dashboard":  # migración desde el nombre anterior
     st.session_state.pagina = "📊 Panel Principal"
 
-# Sincronización inicial con PRIORIDAD A LA NUBE: al abrir, la interfaz refleja
-# los datos oficiales de Drive (lo local obsoleto se respalda, jamás sube).
-# Se ejecuta COMO MÁXIMO 1 vez cada 10 min (típicamente 1 por sesión): hacerla
-# en cada rerun colgaba cada clic ("Agregar al ticket", cambio de menú) con
-# llamadas de red a Drive. El resto de la navegación trabaja 100% en local.
-_sync_ahora = time.time()
-if _sync_ahora - float(st.session_state.get("_sync_inicio_ts", 0)) > 600:
-    drive_sync.sincronizar_inicio()
-    st.session_state["_sync_inicio_ts"] = _sync_ahora
-    st.cache_data.clear()  # lo recién descargado debe verse de inmediato
+# ------------------------------------------------ Estado de sincronización Drive
+if "_is_syncing" not in st.session_state:
+    st.session_state["_is_syncing"] = False  # bloquea sincronizaciones concurrentes
+if "_sync_origen" not in st.session_state:
+    st.session_state["_sync_origen"] = None  # "manual" | "intervalo"
+if "_sync_mensaje" not in st.session_state:
+    st.session_state["_sync_mensaje"] = ""
+if "_sync_ok" not in st.session_state:
+    st.session_state["_sync_ok"] = True
+if "_last_sync_time" not in st.session_state:
+    st.session_state["_last_sync_time"] = None  # marca de tiempo (epoch seg)
+
+INTERVALO_SYNC_SEG = 600  # 10 minutos (600.000 ms)
+
+# --- Verificación automática al cargar/interactuar (ciclo nativo de Streamlit) ---
+# En cada rerun del script se comprueba si han pasado 10 minutos desde la última
+# sincronización y si no hay una en curso. Si corresponde, se ejecuta la sync
+# automática (prioridad nube), se actualiza la marca y se refresca la UI.
+ahora = time.time()
+if (drive_sync.modo_nube()
+        and not st.session_state["_is_syncing"]
+        and (st.session_state["_last_sync_time"] is None
+             or ahora - st.session_state["_last_sync_time"] >= INTERVALO_SYNC_SEG)):
+    st.session_state["_is_syncing"] = True
+    st.session_state["_sync_origen"] = "intervalo"
+    ok, msg = drive_sync.sincronizacion_manual()
+    st.session_state["_is_syncing"] = False
+    st.session_state["_last_sync_time"] = ahora
+    st.session_state["_sync_mensaje"] = msg
+    st.session_state["_sync_ok"] = ok
+    st.cache_data.clear()
+    st.rerun()  # refresca la interfaz de forma segura tras la sync automática
 inv = cargar_inventario()
 ventas = cargar_ventas()
 deud = cargar_deudores()
@@ -929,13 +951,18 @@ with st.sidebar:
         st.info(f"👤 **{auth.get('Nombre', '')}**\n\n🪪 {auth.get('Documento', '')} · 🎭 {auth.get('Rol', '')}")
     if st.button("🚪 Cerrar Sesión", use_container_width=True):
         cerrar_sesion()
-    if st.button("🔄 Sincronizar", use_container_width=True,
-                 help="Descarga la versión oficial de Drive (prioridad a la nube); lo local se respalda en data/_backup_sync/ antes de sobrescribir"):
-        with st.spinner("Sincronizando con Drive..."):
+    if st.button("🔄 Sincronizar con Drive", use_container_width=True,
+                 help="Sincronización manual inmediata (nube primero). Reinicia la cuenta de 10 min"):
+        if not st.session_state["_is_syncing"]:
+            st.session_state["_is_syncing"] = True
+            st.session_state["_sync_origen"] = "manual"
             ok_sync, det_sync = drive_sync.sincronizacion_manual()
-        st.session_state["_sync_msg"] = (ok_sync, det_sync)
-        st.cache_data.clear()
-        st.rerun()
+            st.session_state["_is_syncing"] = False
+            st.session_state["_last_sync_time"] = time.time()
+            st.session_state["_sync_mensaje"] = det_sync
+            st.session_state["_sync_ok"] = ok_sync
+            st.cache_data.clear()
+            st.rerun()
     st.divider()
     st.session_state.pagina = st.radio("Menú", MENU, index=MENU.index(st.session_state.pagina))
     st.divider()
@@ -946,13 +973,19 @@ with st.sidebar:
 
 pg = st.session_state.pagina
 
-_sync_msg = st.session_state.pop("_sync_msg", None)
-if _sync_msg:
-    _ok_m, _det_m = _sync_msg
-    if _ok_m:
-        st.success(f"✅ {_det_m}")
+# Feedback visual de resultado de sincronización (manual o automática)
+if st.session_state.get("_sync_mensaje"):
+    if st.session_state.get("_sync_ok", True):
+        st.success(f"✅ ☁️ {st.session_state['_sync_mensaje']}")
     else:
-        st.error(f"❌ {_det_m}")
+        st.error(f"❌ ☁️ {st.session_state['_sync_mensaje']}")
+    # Mostrar origen y timestamp de la última ejecución
+    origen = st.session_state.get("_sync_origen")
+    ts = st.session_state.get("_last_sync_time")
+    if origen and ts:
+        etiqueta = "Acción manual" if origen == "manual" else "Intervalo de 10 min"
+        ts_str = datetime.fromtimestamp(ts).strftime("%H:%M:%S")
+        st.caption(f"Última sincronización ({etiqueta}): {ts_str}")
 
 # --------------------------------------------------------------- PANEL PRINCIPAL
 if pg == "📊 Panel Principal":
