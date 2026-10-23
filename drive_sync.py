@@ -3,9 +3,10 @@
 Estrategia con PRIORIDAD ABSOLUTA A LA NUBE (cloud-wins):
 - **En PC (sin secrets):** todas las funciones son no-op. Los datos viven en
   `data/` como siempre. No requiere instalar nada extra.
-- **Con secrets (nube configurada):** al arrancar la app y al pulsar
-  "🔄 Sincronizar con Drive" se compara cada archivo local contra su
-  `modifiedTime` de Drive. La nube es la versión oficial:
+- **Con secrets (nube configurada):** la app trabaja 100 % en local y SOLO
+  sincroniza al pulsar "🔄 Sincronizar con Drive". No hay temporizadores ni
+  comprobaciones de red al navegar. Al sincronizar se compara cada archivo
+  local contra su `modifiedTime` de Drive. La nube es la versión oficial:
   - Si Drive es más reciente (o hay empate/conflicto) -> se DESCARGA,
     siempre tras respaldar lo local en `data/_backup_sync/`.
   - Solo se SUBE cuando lo local es claramente más reciente (venta o edición
@@ -54,8 +55,13 @@ SCOPES = ["https://www.googleapis.com/auth/drive"]
 TOLERANCIA_SEG = 30.0
 
 
+@st.cache_resource(show_spinner=False)
 def _leer_secrets() -> dict | None:
-    """Devuelve {'sa': {...}, 'folder': '...'} o None si no hay configuración."""
+    """Devuelve {'sa': {...}, 'folder': '...'} o None si no hay configuración.
+
+    Se lee una sola vez por proceso (archivo local, sin red): así la navegación
+    diaria no toca secretos ni credenciales en cada rerun.
+    """
     try:
         sa = st.secrets.get("gcp_service_account")
         folder = st.secrets.get("GDRIVE_FOLDER_ID", "")
@@ -75,7 +81,8 @@ def modo_nube() -> bool:
 
 
 def estado_almacenamiento() -> str:
-    return "☁️ Drive conectado" if modo_nube() else "💻 Datos locales"
+    return ("☁️ Drive configurado · sync manual" if modo_nube()
+            else "💻 Datos locales")
 
 
 @st.cache_resource
@@ -468,30 +475,6 @@ def _sincronizar_uno(service, folder: str, nombre: str) -> str:
     descargar(nombre)
     _marcar(service, folder, nombre)
     return "conflicto"
-
-
-def sincronizar_inicio() -> str:
-    """Punto de entrada al arrancar la app. Devuelve 'nube' o 'local'.
-
-    Aplica prioridad-nube por archivo (ver _sincronizar_uno): al abrir, la
-    interfaz ya refleja los datos oficiales de Drive. Nunca interrumpe la app.
-    """
-    if not modo_nube():
-        return "local"
-    try:
-        cfg = _leer_secrets()
-        assert cfg is not None
-        service = _servicio()
-        _precargar_metas_remotas(service, cfg["folder"])
-        for nombre in ARCHIVOS_SYNC:
-            try:
-                _sincronizar_uno(service, cfg["folder"], nombre)
-            except Exception:
-                continue
-        return "nube"
-    except Exception as e:  # noqa: BLE001 — la app debe abrir igual
-        st.warning(f"⚠️ No se pudo sincronizar con Drive ({e}). Se usan datos locales.")
-        return "local"
 
 
 def _error_amable(nombre: str, e: Exception) -> str:

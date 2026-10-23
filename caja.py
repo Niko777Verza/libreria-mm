@@ -102,7 +102,7 @@ def asegurar_archivos() -> None:
             _escribir(pd.DataFrame(columns=cols), path, hoja, cols)
 
 
-@st.cache_data(ttl=60)
+@st.cache_data(show_spinner=False)
 def cargar_turnos() -> pd.DataFrame:
     df = _leer(TURNOS_PATH, "Turnos", COL_TURNO)
     normalizar_texto_df(df, ("ID_Turno", "Fecha_Apertura", "Fecha_Cierre", "Cajero_Doc",
@@ -115,7 +115,7 @@ def cargar_turnos() -> pd.DataFrame:
     return df
 
 
-@st.cache_data(ttl=60)
+@st.cache_data(show_spinner=False)
 def cargar_movimientos() -> pd.DataFrame:
     df = _leer(MOVS_PATH, "Movimientos", COL_MOV)
     normalizar_texto_df(df, ("ID_Mov", "ID_Turno", "Fecha", "Tipo", "Concepto",
@@ -125,7 +125,7 @@ def cargar_movimientos() -> pd.DataFrame:
     return df
 
 
-@st.cache_data(ttl=60)
+@st.cache_data(show_spinner=False)
 def cargar_abonos() -> pd.DataFrame:
     df = _leer(ABONOS_PATH, "Abonos", COL_ABONO)
     normalizar_texto_df(df, ("ID_Abono", "ID_Deuda", "Cliente", "Fecha", "Metodo",

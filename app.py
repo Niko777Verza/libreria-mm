@@ -6,8 +6,10 @@ Ejecución: streamlit run app.py
 from __future__ import annotations
 
 import hashlib
+import hmac
 import html
 import io
+import json
 import os
 import re
 import threading
@@ -35,6 +37,8 @@ USU_PATH = DATA_DIR / "usuarios.xlsx"
 CAT_PATH = DATA_DIR / "categorias.txt"
 CAT_HIDE_PATH = DATA_DIR / "categorias_ocultas.txt"
 CATEGORIA_DEFECTO = "Otros"  # Categoría de respaldo: nunca se puede borrar
+SESION_COOKIE = "mm_sesion"  # cookie firmada: mantiene la sesión entre recargas
+SESION_SECRET_PATH = DATA_DIR / ".sesion_secret"  # secreto local (ignorado por git)
 
 MARGEN = 1.5  # CORRECCIÓN 4: Precio_Sugerido = Costo de Compra * 1.5 (nunca desde venta)
 CATEGORIAS_DEFAULT = ["Libros", "Útiles", "Fotocopias", "Servicios", "Juguetes", "Regalería", "Otros"]
@@ -161,7 +165,7 @@ def recalcular_sugerido(costo) -> int:
 
 
 # ------------------------------------------------- Categorías dinámicas (2)
-@st.cache_data(ttl=300)
+@st.cache_data(show_spinner=False)
 def _categorias_disco() -> tuple[list[str], list[str]]:
     guardadas = []
     if CAT_PATH.exists():
@@ -304,7 +308,7 @@ def _guardar_excel(df: pd.DataFrame, path: Path, hoja: str) -> None:
         raise
 
 
-@st.cache_data(ttl=60)
+@st.cache_data(show_spinner=False)
 def cargar_inventario() -> pd.DataFrame:
     df = _leer_excel_seguro(INV_PATH, "Inventario", df_vacio_inv())
     if len(df):
@@ -319,7 +323,7 @@ def cargar_inventario() -> pd.DataFrame:
     return df
 
 
-@st.cache_data(ttl=60)
+@st.cache_data(show_spinner=False)
 def cargar_ventas() -> pd.DataFrame:
     df = _leer_excel_seguro(VENTAS_PATH, "Ventas", df_vacio_ventas())
     if len(df):
@@ -332,7 +336,7 @@ def cargar_ventas() -> pd.DataFrame:
     return df
 
 
-@st.cache_data(ttl=60)
+@st.cache_data(show_spinner=False)
 def cargar_deudores() -> pd.DataFrame:
     df = _leer_excel_seguro(DEUD_PATH, "Deudores", df_vacio_deud())
     if len(df):
@@ -386,7 +390,7 @@ def df_vacio_usu() -> pd.DataFrame:
     return pd.DataFrame(columns=COL_USU)
 
 
-@st.cache_data(ttl=60)
+@st.cache_data(show_spinner=False)
 def cargar_usuarios() -> pd.DataFrame:
     df = _leer_excel_seguro(USU_PATH, "Usuarios", df_vacio_usu())
     if len(df):
@@ -443,7 +447,83 @@ def puede_crear_rol(rol_nuevo: str) -> bool:
     return True
 
 
+# ------------------------------------------- Sesión persistente (cookie)
+def _secreto_sesion() -> bytes:
+    """Secreto para firmar tokens de sesión.
+
+    Prioriza `SESSION_SECRET` de st.secrets (persistente en la nube entre
+    reinicios). Si no existe, usa/crea un archivo local ignorado por git.
+    """
+    try:
+        fijo = st.secrets.get("SESSION_SECRET", "")
+        if fijo:
+            return str(fijo).encode("utf-8")
+    except Exception:
+        pass
+    try:
+        if not SESION_SECRET_PATH.exists():
+            DATA_DIR.mkdir(exist_ok=True)
+            SESION_SECRET_PATH.write_text(os.urandom(32).hex(), encoding="utf-8")
+        return SESION_SECRET_PATH.read_text(encoding="utf-8").strip().encode("utf-8")
+    except OSError:
+        # Último recurso: derivar del equipo (la sesión no sobrevive reinicios raros)
+        return f"{os.getpid()}-{BASE}".encode("utf-8")
+
+
+def token_sesion(documento: str, password_hash: str) -> str:
+    """Token opaco y firmado (HMAC-SHA256) para la cookie de sesión.
+
+    No contiene la contraseña ni el documento: solo permite revalidar al
+    usuario contra `usuarios.xlsx`. Si cambia la contraseña, el token caduca.
+    """
+    return hmac.new(_secreto_sesion(), f"{documento}|{password_hash}".encode("utf-8"),
+                    hashlib.sha256).hexdigest()
+
+
+def usuario_desde_token(token: str, usuarios: pd.DataFrame) -> dict | None:
+    """Devuelve el usuario activo cuyo token coincide, o None si no es válido."""
+    token = (token or "").strip()
+    if not re.fullmatch(r"[0-9a-f]{64}", token) or not len(usuarios):
+        return None
+    for u in usuarios.itertuples():
+        if not bool(u.Activo):
+            continue
+        esperado = token_sesion(str(u.Documento), str(u.Password_Hash))
+        if hmac.compare_digest(esperado, token):
+            return {"Documento": str(u.Documento), "Nombre": str(u.Nombre),
+                    "Rol": str(u.Rol)}
+    return None
+
+
+def _token_cookie() -> str:
+    """Lee la cookie de sesión del navegador (vacío si no existe)."""
+    try:
+        valor = st.context.cookies.get(SESION_COOKIE, "")
+    except Exception:
+        return ""
+    valor = str(valor or "").strip()
+    return valor if re.fullmatch(r"[0-9a-f]{64}", valor) else ""
+
+
+def _escribir_cookie_sesion(token: str | None) -> None:
+    """Crea (token) o borra (None) la cookie desde el navegador, sin bloquear.
+
+    El iframe de componentes hereda el origen de la página, así que puede
+    escribir la cookie del dominio. Cualquier fallo se ignora en silencio.
+    """
+    valor = (f"{SESION_COOKIE}={token}; path=/; max-age=31536000; SameSite=Lax"
+             if token else f"{SESION_COOKIE}=; path=/; max-age=0; SameSite=Lax")
+    components.html(
+        "<script>try{window.parent.document.cookie="
+        + json.dumps(valor)
+        + ";}catch(e){}</script>",
+        height=1,
+    )
+
+
 def cerrar_sesion() -> None:
+    st.session_state["_cookie_borrar"] = True  # se borra en el siguiente render
+    st.session_state.pop("_mi_token", None)
     st.session_state.auth = None
     st.session_state.carrito = []
     st.session_state.items_deuda = []
@@ -585,6 +665,7 @@ def graf_serie(datos: pd.DataFrame, x: str, valor: str, titulo: str = "", alto: 
     return _base_grafico(chart.properties(height=alto), titulo)
 
 
+@st.cache_data(show_spinner=False, max_entries=6)
 def df_a_excel_bytes(hojas: dict[str, pd.DataFrame], con_totales: bool = True) -> bytes:
     """Exporta planillas .xlsx con formato profesional.
 
@@ -864,43 +945,51 @@ if "pagina" not in st.session_state:
 if st.session_state.pagina == "📊 Dashboard":  # migración desde el nombre anterior
     st.session_state.pagina = "📊 Panel Principal"
 
-# ------------------------------------------------ Estado de sincronización Drive
+# ------------------------------- Estado de sincronización (SOLO manual)
 if "_is_syncing" not in st.session_state:
-    st.session_state["_is_syncing"] = False  # bloquea sincronizaciones concurrentes
-if "_sync_origen" not in st.session_state:
-    st.session_state["_sync_origen"] = None  # "manual" | "intervalo"
+    st.session_state["_is_syncing"] = False  # bloquea dobles clics en el botón
 if "_sync_mensaje" not in st.session_state:
     st.session_state["_sync_mensaje"] = ""
 if "_sync_ok" not in st.session_state:
     st.session_state["_sync_ok"] = True
 if "_last_sync_time" not in st.session_state:
-    st.session_state["_last_sync_time"] = None  # marca de tiempo (epoch seg)
+    st.session_state["_last_sync_time"] = None  # última sync MANUAL (epoch seg)
 
-INTERVALO_SYNC_SEG = 600  # 10 minutos (600.000 ms)
+# Sin sincronización automática: la navegación es 100 % local. Drive se toca
+# únicamente al pulsar «🔄 Sincronizar con Drive» o en el respaldo posterior
+# a un cobro (hilo aparte, nunca bloquea la caja). No hay temporizadores,
+# comprobaciones de red ni llamadas a Google en cada rerun.
 
-# --- Verificación automática al cargar/interactuar (ciclo nativo de Streamlit) ---
-# En cada rerun del script se comprueba si han pasado 10 minutos desde la última
-# sincronización y si no hay una en curso. Si corresponde, se ejecuta la sync
-# automática (prioridad nube), se actualiza la marca y se refresca la UI.
-ahora = time.time()
-if (drive_sync.modo_nube()
-        and not st.session_state["_is_syncing"]
-        and (st.session_state["_last_sync_time"] is None
-             or ahora - st.session_state["_last_sync_time"] >= INTERVALO_SYNC_SEG)):
-    st.session_state["_is_syncing"] = True
-    st.session_state["_sync_origen"] = "intervalo"
-    ok, msg = drive_sync.sincronizacion_manual()
-    st.session_state["_is_syncing"] = False
-    st.session_state["_last_sync_time"] = ahora
-    st.session_state["_sync_mensaje"] = msg
-    st.session_state["_sync_ok"] = ok
-    st.cache_data.clear()
-    st.rerun()  # refresca la interfaz de forma segura tras la sync automática
-inv = cargar_inventario()
-ventas = cargar_ventas()
-deud = cargar_deudores()
-usuarios = cargar_usuarios()
+# ------------------------------------- Usuarios + sesión persistente (cookie)
 asegurar_superusuario()
+usuarios = cargar_usuarios()
+
+# Aplicar la cookie pendiente del logout ANTES de leerla (evita carreras)
+_borrando = st.session_state.pop("_cookie_borrar", False)
+if _borrando:
+    _escribir_cookie_sesion(None)
+
+# Sesión indefinida: se restaura desde la cookie firmada tras recargas o
+# reconexiones. Solo «🚪 Cerrar Sesión» la elimina.
+if not st.session_state.auth and not _borrando:
+    _tok_cookie = _token_cookie()
+    _u_cookie = usuario_desde_token(_tok_cookie, usuarios)
+    if _u_cookie:
+        st.session_state.auth = _u_cookie
+        st.session_state["_mi_token"] = _tok_cookie
+
+# Cookie de sesión: se reescribe en cada render autenticado. Es un iframe de
+# 1 px (sin red) y hace que la sesión sobreviva recargas y pestañas nuevas.
+_mi_token = st.session_state.get("_mi_token")
+if st.session_state.auth and not _mi_token:
+    # Sesiones abiertas antes de esta versión: derivar el token del usuario
+    _doc = str(st.session_state.auth.get("Documento", ""))
+    _fila = usuarios[usuarios["Documento"].astype(str) == _doc]
+    if len(_fila):
+        _mi_token = token_sesion(_doc, str(_fila.iloc[0]["Password_Hash"]))
+        st.session_state["_mi_token"] = _mi_token
+if st.session_state.auth and _mi_token:
+    _escribir_cookie_sesion(str(_mi_token))
 
 # ------------------------------------------------------- Puerta de seguridad
 if not st.session_state.auth:
@@ -913,7 +1002,7 @@ if not st.session_state.auth:
             doc = st.text_input("Número de Documento (Cédula)")
             pwd = st.text_input("Contraseña", type="password")
             if st.form_submit_button("➡️ Ingresar", type="primary", use_container_width=True):
-                dfu = cargar_usuarios()
+                dfu = usuarios
                 ok = False
                 if len(dfu):
                     m = dfu[dfu["Documento"].astype(str).str.strip() == doc.strip()]
@@ -923,6 +1012,9 @@ if not st.session_state.auth:
                             st.session_state.auth = {
                                 "Documento": str(u["Documento"]),
                                 "Nombre": str(u["Nombre"]), "Rol": str(u["Rol"])}
+                            # Cookie firmada: sobrevive recargas, pestañas y reinicios
+                            st.session_state["_mi_token"] = token_sesion(
+                                str(u["Documento"]), str(u["Password_Hash"]))
                             ok = True
                 if ok:
                     st.rerun()
@@ -930,8 +1022,14 @@ if not st.session_state.auth:
                     st.error("Documento, contraseña o usuario inactivo incorrectos.")
     st.stop()
 
+# Datos de trabajo: solo se cargan con sesión iniciada (caché en memoria,
+# sin lecturas de disco en cada rerun).
+inv = cargar_inventario()
+ventas = cargar_ventas()
+deud = cargar_deudores()
+
 # Carga de inventario base (necesario para badge de alertas en sidebar y categorías)
-# (ventas/deud/usuarios ya se cargaron arriba, antes del login).
+# (usuarios se cargó antes del login; ventas/deud se cargan solo con sesión).
 CATEGORIAS = obtener_categorias(inv)
 
 # ------------------------------------------------------------------ Sidebar
@@ -952,10 +1050,10 @@ with st.sidebar:
     if st.button("🚪 Cerrar Sesión", use_container_width=True):
         cerrar_sesion()
     if st.button("🔄 Sincronizar con Drive", use_container_width=True,
-                 help="Sincronización manual inmediata (nube primero). Reinicia la cuenta de 10 min"):
+                 help="Sincronización manual (nube primero). Es la única sincronización "
+                      "general: la app navega siempre en local."):
         if not st.session_state["_is_syncing"]:
             st.session_state["_is_syncing"] = True
-            st.session_state["_sync_origen"] = "manual"
             ok_sync, det_sync = drive_sync.sincronizacion_manual()
             st.session_state["_is_syncing"] = False
             st.session_state["_last_sync_time"] = time.time()
@@ -973,19 +1071,17 @@ with st.sidebar:
 
 pg = st.session_state.pagina
 
-# Feedback visual de resultado de sincronización (manual o automática)
+# Feedback visual de la sincronización MANUAL (se muestra una vez)
 if st.session_state.get("_sync_mensaje"):
+    _msg_sync = st.session_state.pop("_sync_mensaje")
     if st.session_state.get("_sync_ok", True):
-        st.success(f"✅ ☁️ {st.session_state['_sync_mensaje']}")
+        st.success(f"✅ ☁️ {_msg_sync}")
     else:
-        st.error(f"❌ ☁️ {st.session_state['_sync_mensaje']}")
-    # Mostrar origen y timestamp de la última ejecución
-    origen = st.session_state.get("_sync_origen")
-    ts = st.session_state.get("_last_sync_time")
-    if origen and ts:
-        etiqueta = "Acción manual" if origen == "manual" else "Intervalo de 10 min"
-        ts_str = datetime.fromtimestamp(ts).strftime("%H:%M:%S")
-        st.caption(f"Última sincronización ({etiqueta}): {ts_str}")
+        st.error(f"❌ ☁️ {_msg_sync}")
+    _last = st.session_state.get("_last_sync_time")
+    if _last:
+        st.caption("Última sincronización manual: "
+                   f"{datetime.fromtimestamp(_last).strftime('%d/%m/%Y %H:%M')}")
 
 # --------------------------------------------------------------- PANEL PRINCIPAL
 if pg == "📊 Panel Principal":
